@@ -1,6 +1,6 @@
 import express, { type Express, type Request, type Response } from "express"
-import Provider, { errors, type Configuration } from "oidc-provider"
-import { createHash, createHmac, timingSafeEqual } from "node:crypto"
+import Provider, { errors, interactionPolicy, type Configuration } from "oidc-provider"
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto"
 import { OAuthStore } from "./oauth-store.js"
 import { hashPassword, readEmployees, verifyPassword } from "./oauth-accounts.js"
 
@@ -37,6 +37,10 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
   store.synchronizeAccounts(fingerprints)
   const keys = store.keys()
   const dummyHash = await hashPassword("not-an-employee-password")
+  const policy = interactionPolicy.base()
+  // Every new connection requires a password; an old browser cookie cannot
+  // silently replace the latest employee connection.
+  policy.get("login")!.checks.add(new interactionPolicy.Check("employee_login", "Sign in to connect.", (_ctx) => !_ctx.oidc.result?.login))
   const configuration: Configuration = {
     adapter: store.adapter(),
     clients: [{ client_id: "chatgpt-law", client_name: "ChatGPT 법령 조회", redirect_uris: redirects,
@@ -67,7 +71,7 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
     },
     routes: { authorization: "/oauth/authorize", token: "/oauth/token", jwks: "/oauth/jwks",
       registration: "/oauth/register", revocation: "/oauth/revoke" },
-    interactions: { url: (_ctx, interaction) => `/oauth/interaction/${interaction.uid}` },
+    interactions: { policy, url: (_ctx, interaction) => `/oauth/interaction/${interaction.uid}` },
     findAccount: async (_ctx, id) => employees.has(id) ? { accountId: id, claims: async () => ({ sub: id }) } : undefined,
     issueRefreshToken: (_ctx, client) => client.grantTypeAllowed("refresh_token"),
     rotateRefreshToken: true,
@@ -116,7 +120,7 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
     const details = await provider.interactionDetails(req, res)
     const fields = `<input type="hidden" name="csrf" value="${csrf(details.uid)}">`
     if (details.prompt.name === "login") {
-      res.send(html(`<h1>법령 MCP 로그인</h1><p>관리자가 발급한 직원 계정으로 로그인해주세요.</p><form method="post" action="/oauth/interaction/${escape(details.uid)}">${fields}<label for="username">아이디</label><input id="username" name="username" autocomplete="username" maxlength="64" required><label for="password">비밀번호</label><input id="password" name="password" type="password" autocomplete="current-password" maxlength="256" required><button name="action" value="login">로그인</button></form>`))
+      res.send(html(`<h1>법령 MCP 로그인</h1><p>관리자가 발급한 직원 계정으로 로그인해주세요.</p><p><small>같은 계정의 기존 연결은 새 로그인이 성공하면 종료됩니다.</small></p><form method="post" action="/oauth/interaction/${escape(details.uid)}">${fields}<label for="username">아이디</label><input id="username" name="username" autocomplete="username" maxlength="64" required><label for="password">비밀번호</label><input id="password" name="password" type="password" autocomplete="current-password" maxlength="256" required><button name="action" value="login">로그인</button></form>`))
     } else if (details.prompt.name === "consent" && details.session && employees.has(details.session.accountId)) {
       const client = await provider.Client.find(String(details.params.client_id))
       res.send(html(`<h1>법령 조회 연결 허용</h1><p><strong>${escape(client?.clientName || "MCP 클라이언트")}</strong>가 <strong>${escape(details.session.accountId)}</strong> 계정으로 법령·판례 조회 도구를 사용하도록 허용합니다.</p><p><small>서버의 법제처 인증값과 직원 비밀번호는 ChatGPT에 전달되지 않습니다.</small></p><form method="post" action="/oauth/interaction/${escape(details.uid)}">${fields}<button name="action" value="consent">허용</button><button name="action" value="deny">취소</button></form>`))
@@ -136,9 +140,12 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
       const employee = employees.get(id)
       const valid = await verifyPassword(req.body.password, employee?.passwordHash || dummyHash)
       if (!employee || !valid) return res.status(401).send(html(`<h1>로그인 정보를 확인해주세요</h1><p class="error">아이디 또는 비밀번호가 올바르지 않습니다.</p><a href="/oauth/interaction/${escape(details.uid)}">다시 로그인</a>`))
-      return provider.interactionFinished(req, res, { login: { accountId: employee.id, amr: ["pwd"], remember: false } }, { mergeWithLastSubmission: false })
+      const connectionId = store.beginLogin(employee.id, details.uid)
+      return provider.interactionFinished(req, res, { login: { accountId: employee.id, amr: ["pwd"], remember: false, connectionId } }, { mergeWithLastSubmission: false })
     }
     if (details.prompt.name === "consent" && req.body.action === "consent" && details.session && employees.has(details.session.accountId)) {
+      const connectionId = details.lastSubmission?.login?.connectionId
+      if (!store.isCurrentLogin(details.session.accountId, connectionId)) return res.status(409).send(html("<h1>다른 곳에서 새로 로그인했습니다</h1><p>이 연결은 종료되었습니다. ChatGPT에서 다시 연결해주세요.</p>"))
       const grant = details.grantId ? await provider.Grant.find(details.grantId) : new provider.Grant({ accountId: details.session.accountId, clientId: String(details.params.client_id) })
       if (!grant) return res.status(400).send("Invalid grant.")
       const prompt = details.prompt.details
@@ -149,6 +156,8 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
         if (aud !== resource || scopes.some(scope => scope !== LAW_SCOPE)) return res.status(400).send("Invalid scope.")
         grant.addResourceScope(aud, scopes.join(" "))
       }
+      grant.jti ||= randomBytes(32).toString("base64url")
+      store.activateGrant(details.session.accountId, connectionId, grant.jti)
       const grantId = await grant.save()
       return provider.interactionFinished(req, res, { consent: { grantId } }, { mergeWithLastSubmission: true })
     }
