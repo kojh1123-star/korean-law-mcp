@@ -254,6 +254,33 @@ describe("ChatGPT OAuth authentication", () => {
     expect((await request("/oauth/revoke", { ...form({ client_id: clientId, token: tokens.access_token }), headers: { "content-type": "application/x-www-form-urlencoded" } })).status).toBe(200)
     expect((await request("/mcp", { headers: { authorization: `Bearer ${tokens.access_token}` } })).status).toBe(401)
   })
+  it("counts admitted employee tool calls without counting lists, legacy access or rejected requests", async () => {
+    const db = new DatabaseSync(join(directory, "oauth.sqlite"))
+    try { db.exec("DELETE FROM employee_usage") } finally { db.close() }
+    const first = await exchange()
+    const second = await exchange("employee02")
+    const call = (token: string, method = "tools/call", body?: unknown) => request("/mcp", {
+      method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json", accept: "application/json, text/event-stream" },
+      body: JSON.stringify(body || { jsonrpc: "2.0", id: 1, method, params: method === "tools/call" ? { name: "test_context", arguments: {} } : {} }),
+    })
+    for (let i = 0; i < 3; i++) expect((await call(first.access_token)).status).toBe(200)
+    expect((await call(second.access_token)).status).toBe(200)
+    expect((await call(first.access_token, "tools/list")).status).toBe(200)
+    expect((await call("test-only-legacy-token")).status).toBe(200)
+    expect((await call("invalid")).status).toBe(401)
+    expect((await call(first.access_token, "tools/call", Array.from({ length: 100 }, (_, id) => ({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "test_context" } })))).status).toBe(429)
+    const saved = new OAuthStore(join(directory, "oauth.sqlite"), base)
+    try {
+      expect(saved.usageSummary("all", ["employee01", "employee02"])).toMatchObject({ total: 4,
+        rows: [{ id: "employee01", calls: 3, percent: 75 }, { id: "employee02", calls: 1, percent: 25 }] })
+    } finally { saved.close() }
+    await adminLogin()
+    const { page } = await adminCsrf()
+    expect(page).toContain("75.0%")
+    expect(page).toContain("25.0%")
+    expect((await (await request("/admin?period=today", {}, true)).text())).toContain("직원별 사용량 · 오늘")
+    expect((await (await request("/admin?period=invalid", {}, true)).text())).toContain("직원별 사용량 · 누적 전체")
+  })
   it("requires an explicit administrator login and rejects forged management requests", async () => {
     cookieJar = new Map()
     expect((await request("/admin", {}, true)).headers.get("location")).toBe("/admin/login")

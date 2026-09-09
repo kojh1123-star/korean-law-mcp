@@ -82,17 +82,25 @@ export function installAdmin(app: Express, options: {
     if (req.method !== "GET" && (req.get("origin") !== issuer || !equal(req.body?.csrf, session.csrf))) return res.status(403).send("요청을 확인할 수 없습니다. 관리자 화면을 다시 열어주세요.")
     next()
   })
-  router.get("/", (_req, res) => {
+  router.get("/", (req, res) => {
     const admin = res.locals.admin
+    const period = req.query.period === "today" || req.query.period === "month" ? req.query.period : "all"
+    const usage = store.usageSummary(period, [...employees.keys()])
+    const periodNames = { today: "오늘", month: "이번 달", all: "누적 전체" }
+    const usageHtml = `<h2>직원별 사용량 · ${periodNames[period]}</h2><nav class="actions" aria-label="사용량 기간">${Object.entries(periodNames).map(([key, label]) => `<a class="button" href="/admin?period=${key}"${period === key ? ' aria-current="page"' : ''}>${label}</a>`).join("")}</nav>
+      <p>직원 전체 <strong>${usage.total.toLocaleString("ko-KR")}회</strong> · 한국시간 기준 · 집계 시작 ${stamp(usage.startedAt)}</p>
+      <div class="scroll"><table aria-label="직원별 사용량"><thead><tr><th>계정</th><th>도구 호출 횟수</th><th>전체 대비 비율</th></tr></thead><tbody>${usage.rows.map(r => `<tr><td>${esc(r.id)}${r.registered ? "" : " (등록 해제)"}</td><td>${r.calls.toLocaleString("ko-KR")}회</td><td>${r.percent.toFixed(1)}% <meter min="0" max="100" value="${r.percent}" aria-label="${esc(r.id)} 사용 비율">${r.percent.toFixed(1)}%</meter></td></tr>`).join("")}</tbody></table></div>
+      <p><small>비율 = 계정 호출 횟수 ÷ 같은 기간 직원 전체 호출 횟수 × 100. 총 0회일 때는 0.0%로 표시하며 반올림으로 비율 합계가 100%와 다를 수 있습니다.<br>직원 로그인으로 접수되어 인증·사용 제한을 통과한 도구 호출 요청을 집계합니다. 처리 중 오류·재시도도 포함합니다. 로그인·도구 목록 확인·관리 화면·공용 토큰 요청은 제외합니다. 법제처 API 호출 횟수나 ChatGPT 토큰·요금과는 다릅니다. 등록 해제된 계정의 기존 사용량도 전체에 포함됩니다. 적용 이전 기록은 없습니다.</small></p>`
     const rows = [...employees.keys()].map(id => store.connectionSummary(id))
     const recent = rows.filter(r => !r.blocked && r.lastRequest !== null && r.lastRequest > Date.now() / 1000 - 300).length
     const csrf = `<input type="hidden" name="csrf" value="${esc(admin.csrf)}">`
     const controls = (id: string, blocked: boolean) => `<form method="post" action="/admin/accounts">${csrf}<input type="hidden" name="target" value="${esc(id)}"><div class="actions"><button class="secondary" name="action" value="disconnect">연결 강제 종료</button>${adminIds.has(id) ? "<small>관리자 계정</small>" : `<button class="${blocked ? "" : "danger"}" name="action" value="${blocked ? "unblock" : "block"}">${blocked ? "차단 해제" : "사용 차단"}</button>`}</div></form>`
     const logs = store.auditLog().map(r => `<tr><td>${stamp(r.at)}</td><td>${esc(r.actor)}</td><td>${esc(r.target)}</td><td>${esc(actionNames[r.action as keyof typeof actionNames] || r.action)}</td></tr>`).join("")
-    res.send(page(`<div class="top"><div><h1>법령 MCP 계정 관리</h1><p>${esc(admin.id)} 관리자 · ${stamp(Math.floor(Date.now() / 1000))} 기준</p></div><div class="actions"><a class="button" href="/admin">새로고침</a><form method="post" action="/admin/logout">${csrf}<button class="secondary">관리자 로그아웃</button></form></div></div>
+    res.send(page(`<div class="top"><div><h1>법령 MCP 계정 관리</h1><p>${esc(admin.id)} 관리자 · ${stamp(Math.floor(Date.now() / 1000))} 기준</p></div><div class="actions"><a class="button" href="/admin?period=${period}">새로고침</a><form method="post" action="/admin/logout">${csrf}<button class="secondary">관리자 로그아웃</button></form></div></div>
       <div class="cards"><div class="card">등록 계정<strong>${rows.length}</strong></div><div class="card">연결 유효<strong>${rows.filter(r => r.connected).length}</strong></div><div class="card">최근 5분 요청 계정<strong>${recent}</strong></div><div class="card">차단 계정<strong>${rows.filter(r => r.blocked).length}</strong></div></div>
       <p>연결 강제 종료: 현재 연결을 끊습니다. 직원은 다시 로그인할 수 있습니다.<br>사용 차단: 현재 연결을 끊고, 차단 해제 전까지 재로그인도 막습니다.</p><div class="scroll"><table><thead><tr><th>계정</th><th>상태</th><th>마지막 로그인</th><th>마지막 MCP 요청</th><th>관리</th></tr></thead><tbody>${rows.map(r => `<tr><td><strong>${esc(r.id)}</strong></td><td class="status ${r.blocked ? "blocked" : r.connected ? "connected" : ""}">${r.blocked ? "사용 차단" : r.connected ? "연결 유효" : "연결 없음"}</td><td>${stamp(r.lastLogin)}</td><td>${stamp(r.lastRequest)}</td><td>${controls(r.id, r.blocked)}</td></tr>`).join("")}</tbody></table></div>
       <p><small>‘연결 유효’는 유효한 조회·갱신 인증정보가 있는 계정 수입니다. 실제로 화면을 보고 있는 인원수와 다릅니다. 최근 요청에는 도구 목록 확인 등도 포함되며, 기록은 이 기능 적용 이후부터 집계합니다. 이미 처리 중인 요청은 계속될 수 있습니다.</small></p>
+      ${usageHtml}
       <h2>최근 관리 기록</h2><p>최대 90일 보관 · 최근 30건 표시</p><div class="scroll"><table><thead><tr><th>시각 (한국)</th><th>관리자</th><th>대상 계정</th><th>작업</th></tr></thead><tbody>${logs || '<tr><td colspan="4">아직 관리 기록이 없습니다.</td></tr>'}</tbody></table></div>`))
   })
   router.post("/accounts", (req, res) => {
