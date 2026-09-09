@@ -254,6 +254,68 @@ describe("ChatGPT OAuth authentication", () => {
     expect((await request("/oauth/revoke", { ...form({ client_id: clientId, token: tokens.access_token }), headers: { "content-type": "application/x-www-form-urlencoded" } })).status).toBe(200)
     expect((await request("/mcp", { headers: { authorization: `Bearer ${tokens.access_token}` } })).status).toBe(401)
   })
+  it("creates employees immediately and validates input, role and request provenance", async () => {
+    expect((await request("/admin/employees", form({ username: "new_employee", password, repeat: password }))).status).toBe(401)
+    await adminLogin()
+    const { csrf } = await adminCsrf()
+    const fields = { csrf, username: "new_employee", password, repeat: password }
+    expect((await request("/admin/employees", form({ ...fields, csrf: "forged" }), true)).status).toBe(403)
+    expect((await request("/admin/employees", { ...form(fields), headers: { "content-type": "application/x-www-form-urlencoded", origin: "https://attacker.example" } }, true)).status).toBe(403)
+    expect((await request("/admin/employees", form({ ...fields, username: "bad<id" }), true)).status).toBe(400)
+    expect((await request("/admin/employees", form({ ...fields, password: "short", repeat: "short" }), true)).status).toBe(400)
+    expect((await request("/admin/employees", form({ ...fields, repeat: "not-the-same-password" }), true)).status).toBe(400)
+    expect((await request("/admin/employees", form({ ...fields, username: "employee01" }), true)).status).toBe(409)
+    const results = await Promise.all([request("/admin/employees", form(fields), true), request("/admin/employees", form(fields), true)])
+    expect(results.map(r => r.status).sort()).toEqual([303, 409])
+    const added = await exchange("new_employee")
+    expect((await request("/mcp", { headers: { authorization: `Bearer ${added.access_token}` } })).status).toBe(405)
+    expect((await adminLogin("new_employee")).status).toBe(401)
+    const db = new DatabaseSync(join(directory, "oauth.sqlite"))
+    try {
+      const row = db.prepare("SELECT password_hash FROM managed_employees WHERE id='new_employee'").get()!
+      expect(row.password_hash).not.toBe(password)
+      expect(await verifyPassword(password, String(row.password_hash))).toBe(true)
+      expect(db.prepare("SELECT COUNT(*) AS count FROM admin_audit WHERE target='new_employee' AND action='create'").get()?.count).toBe(1)
+    } finally { db.close() }
+  })
+  it("removes a new employee, revokes access and pending consent, and protects administrator accounts", async () => {
+    await adminLogin()
+    let csrf = (await adminCsrf()).csrf
+    expect((await request("/admin/employees", form({ csrf, username: "remove_employee", password, repeat: password }), true)).status).toBe(303)
+    expect((await request("/admin/employees", form({ csrf, username: "pending_employee", password, repeat: password }), true)).status).toBe(303)
+    const old = await exchange("remove_employee")
+    const pending = await login("pending_employee")
+    const pendingCookies = new Map(cookieJar)
+    await adminLogin()
+    csrf = (await adminCsrf()).csrf
+    const fields = { csrf, target: "remove_employee", confirmTarget: "remove_employee" }
+    expect((await request("/admin/remove?target=employee02", {}, true)).status).toBe(403)
+    expect((await request("/admin/remove", form({ ...fields, target: "employee02", confirmTarget: "employee02" }), true)).status).toBe(403)
+    expect((await request("/admin/remove", form({ ...fields, csrf: "forged" }), true)).status).toBe(403)
+    expect((await request("/admin/remove", { ...form(fields), headers: { "content-type": "application/x-www-form-urlencoded", origin: "https://attacker.example" } }, true)).status).toBe(403)
+    expect((await request("/admin/remove", form({ ...fields, confirmTarget: "wrong" }), true)).status).toBe(400)
+    expect((await request("/admin/remove?target=remove_employee", {}, true)).status).toBe(200)
+    const persisted = new OAuthStore(join(directory, "oauth.sqlite"), base)
+    try { persisted.recordToolCalls("remove_employee", 2) } finally { persisted.close() }
+    expect((await request("/mcp", { headers: { authorization: `Bearer ${old.access_token}` } })).status).toBe(405)
+    expect((await request("/admin/remove", form(fields), true)).status).toBe(303)
+    expect((await adminCsrf()).page).toContain("remove_employee (등록 해제)")
+    expect((await request("/admin/employees", form({ csrf, username: "remove_employee", password, repeat: password }), true)).status).toBe(409)
+    expect((await request("/mcp", { headers: { authorization: `Bearer ${old.access_token}` } })).status).toBe(401)
+    expect((await tokenRequest({ grant_type: "refresh_token", refresh_token: old.refresh_token, resource })).status).toBe(400)
+    expect((await request("/admin/remove", form({ csrf, target: "pending_employee", confirmTarget: "pending_employee" }), true)).status).toBe(303)
+    cookieJar = pendingCookies
+    expect((await request(pending.next, form({ csrf: pending.consentCsrf, action: "consent" }), true)).status).toBe(400)
+    const attempt = await startAuthorization()
+    const path = attempt.response.headers.get("location")!
+    const loginPage = await (await request(path, {}, true)).text()
+    const loginCsrf = loginPage.match(/name="csrf" value="([^"]+)"/)![1]
+    expect((await request(path, form({ csrf: loginCsrf, username: "remove_employee", password, action: "login" }), true)).status).toBe(401)
+    const db = new DatabaseSync(join(directory, "oauth.sqlite"))
+    try {
+      expect(db.prepare("SELECT password_hash,removed FROM managed_employees WHERE id='remove_employee'").get()).toMatchObject({ password_hash: null, removed: 1 })
+    } finally { db.close() }
+  })
   it("counts admitted employee tool calls without counting lists, legacy access or rejected requests", async () => {
     const db = new DatabaseSync(join(directory, "oauth.sqlite"))
     try { db.exec("DELETE FROM employee_usage") } finally { db.close() }

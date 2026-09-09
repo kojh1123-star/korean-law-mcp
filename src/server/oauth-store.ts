@@ -3,6 +3,7 @@ import { mkdirSync, chmodSync } from "node:fs"
 import { dirname, isAbsolute } from "node:path"
 import { generateKeyPairSync, randomBytes } from "node:crypto"
 import { errors, type AdapterPayload, type AdapterConstructor } from "oidc-provider"
+import type { Employee } from "./oauth-accounts.js"
 
 /** One Railway replica backed by a mounted volume; never an in-memory production adapter. */
 export class OAuthStore {
@@ -39,10 +40,35 @@ export class OAuthStore {
         day TEXT NOT NULL, account_id TEXT NOT NULL, calls INTEGER NOT NULL,
         PRIMARY KEY(day, account_id)
       );
+      CREATE TABLE IF NOT EXISTS managed_employees (
+        id TEXT PRIMARY KEY, password_hash TEXT, removed INTEGER NOT NULL DEFAULT 0
+      );
     `)
     const savedIssuer = this.setting("issuer", () => issuer)
     if (savedIssuer !== issuer) { this.close(); throw new Error("OAuth database issuer differs from OAUTH_ISSUER. Use the original issuer or a new volume.") }
     this.setting("usage-started-at", () => String(Math.floor(Date.now() / 1000)))
+  }
+  /** Database additions/removals override bootstrap environment accounts on every restart. */
+  loadEmployees(bootstrap: Map<string, Employee>): Map<string, Employee> {
+    const employees = new Map(bootstrap)
+    for (const row of this.db.prepare("SELECT id,password_hash,removed FROM managed_employees").all()) {
+      const id = String(row.id)
+      if (row.removed === 1) employees.delete(id)
+      else employees.set(id, { id, passwordHash: String(row.password_hash) })
+    }
+    if (employees.size > 1000) throw new Error("At most 1000 active employee accounts are allowed.")
+    return employees
+  }
+  wasManaged(id: string): boolean {
+    return !!this.db.prepare("SELECT 1 FROM managed_employees WHERE id=?").get(id)
+  }
+  addEmployee(actor: string, employee: Employee) {
+    this.db.exec("BEGIN IMMEDIATE")
+    try {
+      this.db.prepare("INSERT INTO managed_employees(id,password_hash) VALUES(?,?)").run(employee.id, employee.passwordHash)
+      this.db.prepare("INSERT INTO admin_audit(at,actor,target,action) VALUES(?,?,?,'create')").run(Math.floor(Date.now() / 1000), actor, employee.id)
+      this.db.exec("COMMIT")
+    } catch (error) { this.db.exec("ROLLBACK"); throw error }
   }
   /** Accepted tools/call attempts, including eventual errors; never query text or tokens. */
   recordToolCalls(accountId: string, count: number, now = Date.now()) {
@@ -100,7 +126,7 @@ export class OAuthStore {
       lastLogin: controls?.last_login == null ? null : Number(controls.last_login),
       lastRequest: controls?.last_request == null ? null : Number(controls.last_request) }
   }
-  manageAccount(actor: string, target: string, action: "disconnect" | "block" | "unblock") {
+  manageAccount(actor: string, target: string, action: "disconnect" | "block" | "unblock" | "remove") {
     this.db.exec("BEGIN IMMEDIATE")
     try {
       if (action !== "unblock") {
@@ -111,7 +137,12 @@ export class OAuthStore {
           OR (model='Interaction' AND (json_extract(payload,'$.session.accountId')=? OR json_extract(payload,'$.result.login.accountId')=?))`).run(target, target, target)
       }
       if (action !== "disconnect") this.db.prepare(`INSERT INTO account_controls(account_id,blocked) VALUES(?,?)
-        ON CONFLICT(account_id) DO UPDATE SET blocked=excluded.blocked`).run(target, action === "block" ? 1 : 0)
+        ON CONFLICT(account_id) DO UPDATE SET blocked=excluded.blocked`).run(target, action === "unblock" ? 0 : 1)
+      if (action === "remove") {
+        this.db.prepare(`INSERT INTO managed_employees(id,password_hash,removed) VALUES(?,NULL,1)
+          ON CONFLICT(id) DO UPDATE SET password_hash=NULL, removed=1`).run(target)
+        this.revokeAdminSessions(target)
+      }
       this.db.prepare("INSERT INTO admin_audit(at,actor,target,action) VALUES(?,?,?,?)").run(Math.floor(Date.now() / 1000), actor, target, action)
       this.db.exec("COMMIT")
     } catch (error) { this.db.exec("ROLLBACK"); throw error }
