@@ -94,7 +94,10 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
   app.use((req, res, next) => {
     if (!req.path.startsWith("/oauth/") && !DISCOVERY_PATHS.has(req.path) && !METADATA_PATHS.includes(req.path)) return next()
     res.setHeader("Cache-Control", "no-store")
-    res.setHeader("Referrer-Policy", "no-referrer")
+    // no-referrer makes browsers send Origin: null on HTML form POSTs,
+    // which conflicts with the exact-origin CSRF check below. Keep the origin
+    // for our own login/consent forms while withholding referrers off-site.
+    res.setHeader("Referrer-Policy", "same-origin")
     res.setHeader("X-Content-Type-Options", "nosniff")
     res.setHeader("X-Frame-Options", "DENY")
     res.setHeader("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")

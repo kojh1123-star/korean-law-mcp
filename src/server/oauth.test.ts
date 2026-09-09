@@ -51,6 +51,7 @@ async function authorize() {
   expect(response.status).toBe(303)
   let next = response.headers.get("location")!
   let page = await request(next, {}, true)
+  expect(page.headers.get("referrer-policy")).toBe("same-origin")
   let body = await page.text()
   expect(body).toContain("법령 MCP 로그인")
   const csrf = body.match(/name="csrf" value="([^"]+)"/)![1]
@@ -61,6 +62,7 @@ async function authorize() {
   expect(resume.status).toBe(303)
   next = resume.headers.get("location")!
   page = await request(next, {}, true)
+  expect(page.headers.get("referrer-policy")).toBe("same-origin")
   body = await page.text()
   expect(body).toContain("법령 조회 연결 허용")
   const consentCsrf = body.match(/name="csrf" value="([^"]+)"/)![1]
@@ -147,6 +149,11 @@ describe("ChatGPT OAuth authentication", () => {
     const fields = { csrf, username: "employee01", password, action: "login" }
     expect((await request(location, form({ ...fields, csrf: "0".repeat(64) }), true)).status).toBe(403)
     expect((await request(location, { ...form(fields), headers: { "content-type": "application/x-www-form-urlencoded", origin: "https://attacker.example" } }, true)).status).toBe(403)
+    for (const origin of ["null", undefined]) {
+      const headers: Record<string, string> = { "content-type": "application/x-www-form-urlencoded" }
+      if (origin !== undefined) headers.origin = origin
+      expect((await request(location, { ...form(fields), headers }, true)).status).toBe(403)
+    }
     expect((await request(location, form({ ...fields, password: "wrong" }), true)).status).toBe(401)
     expect((await request(location, form(fields), false)).status).toBeGreaterThanOrEqual(400)
   })
