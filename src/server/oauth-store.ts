@@ -1,7 +1,7 @@
 import { DatabaseSync } from "node:sqlite"
 import { mkdirSync, chmodSync } from "node:fs"
 import { dirname, isAbsolute } from "node:path"
-import { generateKeyPairSync, randomBytes } from "node:crypto"
+import { createHash, generateKeyPairSync, randomBytes } from "node:crypto"
 import { errors, type AdapterPayload, type AdapterConstructor } from "oidc-provider"
 import type { Employee } from "./oauth-accounts.js"
 
@@ -43,6 +43,7 @@ export class OAuthStore {
       CREATE TABLE IF NOT EXISTS managed_employees (
         id TEXT PRIMARY KEY, password_hash TEXT, removed INTEGER NOT NULL DEFAULT 0
       );
+      CREATE TABLE IF NOT EXISTS account_renames (old_id TEXT PRIMARY KEY, new_id TEXT NOT NULL);
     `)
     const savedIssuer = this.setting("issuer", () => issuer)
     if (savedIssuer !== issuer) { this.close(); throw new Error("OAuth database issuer differs from OAUTH_ISSUER. Use the original issuer or a new volume.") }
@@ -61,6 +62,45 @@ export class OAuthStore {
   }
   wasManaged(id: string): boolean {
     return !!this.db.prepare("SELECT 1 FROM managed_employees WHERE id=?").get(id)
+      || !!this.db.prepare("SELECT 1 FROM employee_usage WHERE account_id=? LIMIT 1").get(id)
+  }
+  resolveAccountId(id: string): string {
+    const seen = new Set<string>()
+    while (!seen.has(id)) {
+      seen.add(id)
+      const row = this.db.prepare("SELECT new_id FROM account_renames WHERE old_id=?").get(id)
+      if (!row) return id
+      id = String(row.new_id)
+    }
+    throw new Error("Invalid account rename chain.")
+  }
+  /** Commit credentials, role alias, history migration and revocation as one atomic change. */
+  changeAdminAccount(previous: Employee, next: Employee) {
+    this.db.exec("BEGIN IMMEDIATE")
+    try {
+      if (previous.id !== next.id && this.wasManaged(next.id)) throw new Error("Account ID already used.")
+      this.db.prepare(`INSERT INTO managed_employees(id,password_hash,removed) VALUES(?,?,0)
+        ON CONFLICT(id) DO UPDATE SET password_hash=excluded.password_hash, removed=0`).run(next.id, next.passwordHash)
+      this.db.prepare("DELETE FROM active_connections WHERE account_id=?").run(previous.id)
+      const grants = this.db.prepare("SELECT id FROM objects WHERE model='Grant' AND json_extract(payload,'$.accountId')=?").all(previous.id)
+      for (const grant of grants) this.revokeGrant(String(grant.id))
+      this.db.prepare(`DELETE FROM objects WHERE json_extract(payload,'$.accountId')=?
+        OR (model='Interaction' AND (json_extract(payload,'$.session.accountId')=? OR json_extract(payload,'$.result.login.accountId')=?))`).run(previous.id, previous.id, previous.id)
+      if (previous.id !== next.id) {
+        this.db.prepare(`INSERT INTO managed_employees(id,password_hash,removed) VALUES(?,NULL,1)
+          ON CONFLICT(id) DO UPDATE SET password_hash=NULL, removed=1`).run(previous.id)
+        this.db.prepare("INSERT INTO account_renames(old_id,new_id) VALUES(?,?)").run(previous.id, next.id)
+        this.db.prepare("UPDATE employee_usage SET account_id=? WHERE account_id=?").run(next.id, previous.id)
+        this.db.prepare("UPDATE account_controls SET account_id=? WHERE account_id=?").run(next.id, previous.id)
+        this.db.prepare("INSERT INTO account_controls(account_id,blocked) VALUES(?,1)").run(previous.id)
+      }
+      const fingerprints = JSON.parse(this.setting("accounts", () => "{}")) as Record<string, string>
+      delete fingerprints[previous.id]
+      fingerprints[next.id] = createHash("sha256").update(next.passwordHash).digest("hex")
+      this.db.prepare("UPDATE settings SET value=? WHERE key='accounts'").run(JSON.stringify(fingerprints))
+      this.db.prepare("INSERT INTO admin_audit(at,actor,target,action) VALUES(?,?,?,'credentials')").run(Math.floor(Date.now() / 1000), previous.id, next.id)
+      this.db.exec("COMMIT")
+    } catch (error) { this.db.exec("ROLLBACK"); throw error }
   }
   addEmployee(actor: string, employee: Employee) {
     this.db.exec("BEGIN IMMEDIATE")
@@ -73,6 +113,7 @@ export class OAuthStore {
   /** Accepted tools/call attempts, including eventual errors; never query text or tokens. */
   recordToolCalls(accountId: string, count: number, now = Date.now()) {
     if (!Number.isSafeInteger(count) || count <= 0) return
+    accountId = this.resolveAccountId(accountId)
     const day = new Date(now + 9 * 3600000).toISOString().slice(0, 10)
     this.db.prepare(`INSERT INTO employee_usage VALUES(?,?,?)
       ON CONFLICT(day,account_id) DO UPDATE SET calls=employee_usage.calls+excluded.calls`).run(day, accountId, count)
