@@ -27,7 +27,7 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
   if (!local && !env.OAUTH_DB_PATH) throw new Error("Set OAUTH_DB_PATH to a Railway volume path.")
   if (!local && env.OAUTH_DB_PATH === ":memory:") throw new Error("Production OAuth requires persistent storage.")
   const bootstrapEmployees = readEmployees(env.OAUTH_USERS_JSON)
-  const adminIds = new Set((env.OAUTH_ADMIN_IDS || "").split(",").map(id => id.trim()).filter(Boolean))
+  const configuredAdminIds = (env.OAUTH_ADMIN_IDS || "").split(",").map(id => id.trim()).filter(Boolean)
   const redirects = (env.OAUTH_REDIRECT_URIS || CHATGPT_CALLBACK).split(",").map(x => x.trim())
   if (!redirects.length || redirects.some(uri => {
     try { const u = new URL(uri); return u.protocol !== "https:" || !!u.hash || !!u.username || !!u.password } catch { return true }
@@ -36,6 +36,7 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
   const store = new OAuthStore(env.OAUTH_DB_PATH || ":memory:", issuer)
   try {
   const employees = store.loadEmployees(bootstrapEmployees)
+  const adminIds = new Set(configuredAdminIds.map(id => store.resolveAccountId(id)))
   if ([...adminIds].some(id => !employees.has(id))) throw new Error("OAUTH_ADMIN_IDS must name registered employee accounts.")
   const fingerprints = Object.fromEntries([...employees].map(([id, employee]) => [id, createHash("sha256").update(employee.passwordHash).digest("hex")]))
   store.synchronizeAccounts(fingerprints)

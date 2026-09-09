@@ -11,7 +11,7 @@ const equal = (a: unknown, b: unknown) => typeof a === "string" && typeof b === 
 const stamp = (v: unknown) => v == null ? "기록 없음" : new Intl.DateTimeFormat("ko-KR", {
   timeZone: "Asia/Seoul", dateStyle: "short", timeStyle: "medium",
 }).format(new Date(Number(v) * 1000))
-const actionNames = { disconnect: "연결 강제 종료", block: "사용 차단", unblock: "차단 해제", create: "계정 추가", remove: "계정 제거" }
+const actionNames = { disconnect: "연결 강제 종료", block: "사용 차단", unblock: "차단 해제", create: "계정 추가", remove: "계정 제거", credentials: "관리자 로그인 정보 변경" }
 function page(body: string) {
   return `<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>법령 MCP 관리</title>
   <style>body{margin:0;background:#f3f5f8;color:#182337;font:15px/1.6 system-ui,sans-serif}main{max-width:1120px;margin:40px auto;padding:28px;background:white;border:1px solid #dbe2ec;border-radius:16px}h1{margin:0;font-size:28px}h2{font-size:20px;margin-top:28px}p{color:#526176}a{color:#164eb5}label{display:block;margin:16px 0 5px}input{padding:11px;border:1px solid #aab5c5;border-radius:7px;font:inherit;max-width:95%}button,.button{display:inline-block;border:0;border-radius:7px;padding:10px 14px;background:#164eb5;color:white;font:inherit;text-decoration:none;cursor:pointer}button.danger{background:#b52d36}button.secondary{background:#e9eef6;color:#213958}.actions{display:flex;gap:8px;flex-wrap:wrap}.top{display:flex;justify-content:space-between;align-items:center;gap:16px}.cards{display:flex;gap:14px;flex-wrap:wrap;margin:24px 0}.card{padding:16px 22px;background:#f3f6fb;border-radius:10px;min-width:150px}.card strong{display:block;font-size:30px;color:#164eb5}.scroll{overflow:auto}table{border-collapse:collapse;width:100%;white-space:nowrap}th,td{text-align:left;padding:13px 12px;border-bottom:1px solid #e4e8ee}th{background:#f5f7fa}.status{font-weight:600}.blocked{color:#ad2636}.connected{color:#08745a}.notice{padding:12px 16px;background:#e9f6ef;color:#215e3b;border-radius:8px}.login{max-width:420px}.error{color:#ac2835}small{color:#65738a}@media(max-width:700px){main{margin:12px;padding:20px}.top{align-items:flex-start;flex-direction:column}}</style><main>${body}</main></html>`
@@ -101,7 +101,7 @@ export function installAdmin(app: Express, options: {
       <label for="new-password-repeat">비밀번호 확인</label><input id="new-password-repeat" name="repeat" type="password" minlength="12" maxlength="256" autocomplete="new-password" required><p><button>계정 추가</button></p></form></details>`
     const controls = (id: string, blocked: boolean) => `<form method="post" action="/admin/accounts">${csrf}<input type="hidden" name="target" value="${esc(id)}"><div class="actions"><button class="secondary" name="action" value="disconnect">연결 강제 종료</button>${adminIds.has(id) ? "<small>관리자 계정</small>" : `<button class="${blocked ? "" : "danger"}" name="action" value="${blocked ? "unblock" : "block"}">${blocked ? "차단 해제" : "사용 차단"}</button><a class="button secondary" href="/admin/remove?target=${encodeURIComponent(id)}">계정 제거</a>`}</div></form>`
     const logs = store.auditLog().map(r => `<tr><td>${stamp(r.at)}</td><td>${esc(r.actor)}</td><td>${esc(r.target)}</td><td>${esc(actionNames[r.action as keyof typeof actionNames] || r.action)}</td></tr>`).join("")
-    res.send(page(`<div class="top"><div><h1>법령 MCP 계정 관리</h1><p>${esc(admin.id)} 관리자 · ${stamp(Math.floor(Date.now() / 1000))} 기준</p></div><div class="actions"><a class="button" href="/admin?period=${period}">새로고침</a><form method="post" action="/admin/logout">${csrf}<button class="secondary">관리자 로그아웃</button></form></div></div>
+    res.send(page(`<div class="top"><div><h1>법령 MCP 계정 관리</h1><p>${esc(admin.id)} 관리자 · ${stamp(Math.floor(Date.now() / 1000))} 기준</p></div><div class="actions"><a class="button secondary" href="/admin/profile">내 로그인 정보 변경</a><a class="button" href="/admin?period=${period}">새로고침</a><form method="post" action="/admin/logout">${csrf}<button class="secondary">관리자 로그아웃</button></form></div></div>
       ${notice ? `<p class="notice" role="status">${notice}</p>` : ""}
       <div class="cards"><div class="card">등록 계정<strong>${rows.length}</strong></div><div class="card">연결 유효<strong>${rows.filter(r => r.connected).length}</strong></div><div class="card">최근 5분 요청 계정<strong>${recent}</strong></div><div class="card">차단 계정<strong>${rows.filter(r => r.blocked).length}</strong></div></div>
       <p>연결 강제 종료: 현재 연결을 끊습니다. 직원은 다시 로그인할 수 있습니다.<br>사용 차단: 현재 연결을 끊고, 차단 해제 전까지 재로그인도 막습니다.</p><div class="scroll"><table><thead><tr><th>계정</th><th>상태</th><th>마지막 로그인</th><th>마지막 MCP 요청</th><th>관리</th></tr></thead><tbody>${rows.map(r => `<tr><td><strong>${esc(r.id)}</strong></td><td class="status ${r.blocked ? "blocked" : r.connected ? "connected" : ""}">${r.blocked ? "사용 차단" : r.connected ? "연결 유효" : "연결 없음"}</td><td>${stamp(r.lastLogin)}</td><td>${stamp(r.lastRequest)}</td><td>${controls(r.id, r.blocked)}</td></tr>`).join("")}</tbody></table></div>
@@ -111,6 +111,37 @@ export function installAdmin(app: Express, options: {
       <h2>최근 관리 기록</h2><p>최대 90일 보관 · 최근 30건 표시</p><div class="scroll"><table><thead><tr><th>시각 (한국)</th><th>관리자</th><th>대상 계정</th><th>작업</th></tr></thead><tbody>${logs || '<tr><td colspan="4">아직 관리 기록이 없습니다.</td></tr>'}</tbody></table></div>`))
   })
   const accountError = (res: Response, status: number, message: string) => res.status(status).send(page(`<h1>계정 관리</h1><p class="error">${esc(message)}</p><a href="/admin">관리자 화면으로 돌아가기</a>`))
+  router.get("/profile", (_req, res) => {
+    res.send(page(`<h1>내 로그인 정보 변경</h1><p>본인 관리자 아이디와 비밀번호를 변경합니다. 아이디는 영문·숫자·점·밑줄·하이픈 3~64자이며 대소문자를 구분합니다. 새 비밀번호를 비워두면 현재 비밀번호를 유지합니다.</p>
+      <form method="post" action="/admin/profile"><input type="hidden" name="csrf" value="${esc(res.locals.admin.csrf)}">
+      <label for="profile-id">변경할 아이디</label><input id="profile-id" name="username" value="${esc(res.locals.admin.id)}" minlength="3" maxlength="64" autocomplete="username" required>
+      <label for="current-password">현재 비밀번호</label><input id="current-password" name="currentPassword" type="password" maxlength="256" autocomplete="current-password" required>
+      <label for="profile-password">새 비밀번호 (선택)</label><input id="profile-password" name="password" type="password" minlength="12" maxlength="256" autocomplete="new-password">
+      <label for="profile-repeat">새 비밀번호 확인</label><input id="profile-repeat" name="repeat" type="password" minlength="12" maxlength="256" autocomplete="new-password">
+      <p>저장하면 본인의 관리자 로그인과 법령 MCP 연결이 종료됩니다. 새 정보로 다시 로그인하세요. 관리자 권한과 기존 사용량은 유지되고, 이전 아이디는 재사용할 수 없습니다. 다른 직원의 연결은 유지됩니다.</p><p class="actions"><button>로그인 정보 변경 저장</button><a class="button secondary" href="/admin">취소</a></p></form>`))
+  })
+  router.post("/profile", async (req, res) => {
+    const previous = employees.get(res.locals.admin.id)
+    const { username: id, currentPassword, password = "", repeat = "" } = req.body || {}
+    if (!previous || !store.hit(`admin-profile:${digest(previous.id)}`, 5, 300)) return accountError(res, 429, "변경 시도가 많습니다. 5분 뒤 다시 시도해주세요.")
+    if (typeof id !== "string" || !/^[a-zA-Z0-9._-]{3,64}$/.test(id)) return accountError(res, 400, "아이디 형식을 확인해주세요.")
+    if (typeof password !== "string" || password !== repeat || (password !== "" && (password.length < 12 || Buffer.byteLength(password) > 256))) return accountError(res, 400, "새 비밀번호는 12자 이상, UTF-8 256바이트 이하로 두 번 동일하게 입력해주세요.")
+    if (!await verifyPassword(currentPassword, previous.passwordHash)) return accountError(res, 401, "현재 비밀번호가 올바르지 않습니다.")
+    if (id === previous.id && password === "") return accountError(res, 400, "변경할 아이디 또는 새 비밀번호를 입력해주세요.")
+    const passwordHash = password === "" ? previous.passwordHash : await hashPassword(password)
+    const activeSession = await sessions.find(res.locals.admin.key)
+    if (employees.get(previous.id) !== previous || !adminIds.has(previous.id) || store.isBlocked(previous.id) || !activeSession) return accountError(res, 401, "로그인 상태가 변경되었습니다. 다시 로그인해주세요.")
+    if (id !== previous.id && (employees.has(id) || store.wasManaged(id))) return accountError(res, 409, "이미 사용한 아이디입니다. 다른 아이디를 입력해주세요.")
+    const next = { id, passwordHash }
+    store.changeAdminAccount(previous, next)
+    employees.delete(previous.id)
+    employees.set(id, next)
+    adminIds.delete(previous.id)
+    adminIds.add(id)
+    res.clearCookie(cookieName, cookieOptions)
+    res.clearCookie(preName, cookieOptions)
+    res.send(page(`<h1>로그인 정보 변경 완료</h1><p>관리자 아이디: <strong>${esc(id)}</strong></p><p>관리자 권한과 기존 사용량은 유지됩니다. 새 정보로 관리자 화면에 로그인하고, ChatGPT의 법령 MCP도 다시 연결해주세요.</p><a class="button" href="/admin/login">관리자 다시 로그인</a>`))
+  })
   router.post("/employees", async (req, res) => {
     const { username: id, password, repeat } = req.body || {}
     if (typeof id !== "string" || !/^[a-zA-Z0-9._-]{3,64}$/.test(id)) return accountError(res, 400, "아이디는 영문·숫자·점·밑줄·하이픈 3~64자로 입력해주세요.")
