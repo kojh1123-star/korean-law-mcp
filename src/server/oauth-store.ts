@@ -35,9 +35,33 @@ export class OAuthStore {
         id INTEGER PRIMARY KEY, at INTEGER NOT NULL, actor TEXT NOT NULL,
         target TEXT NOT NULL, action TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS employee_usage (
+        day TEXT NOT NULL, account_id TEXT NOT NULL, calls INTEGER NOT NULL,
+        PRIMARY KEY(day, account_id)
+      );
     `)
     const savedIssuer = this.setting("issuer", () => issuer)
     if (savedIssuer !== issuer) { this.close(); throw new Error("OAuth database issuer differs from OAUTH_ISSUER. Use the original issuer or a new volume.") }
+    this.setting("usage-started-at", () => String(Math.floor(Date.now() / 1000)))
+  }
+  /** Accepted tools/call attempts, including eventual errors; never query text or tokens. */
+  recordToolCalls(accountId: string, count: number, now = Date.now()) {
+    if (!Number.isSafeInteger(count) || count <= 0) return
+    const day = new Date(now + 9 * 3600000).toISOString().slice(0, 10)
+    this.db.prepare(`INSERT INTO employee_usage VALUES(?,?,?)
+      ON CONFLICT(day,account_id) DO UPDATE SET calls=employee_usage.calls+excluded.calls`).run(day, accountId, count)
+  }
+  usageSummary(period: "today" | "month" | "all", accountIds: string[], now = Date.now()) {
+    const today = new Date(now + 9 * 3600000).toISOString().slice(0, 10)
+    const from = period === "today" ? today : period === "month" ? today.slice(0, 7) + "-01" : "0000-01-01"
+    const saved = this.db.prepare(`SELECT account_id, SUM(calls) AS calls FROM employee_usage
+      WHERE day>=? AND day<=? GROUP BY account_id`).all(from, today)
+    const counts = new Map(saved.map(r => [String(r.account_id), Number(r.calls)]))
+    const ids = [...new Set([...accountIds, ...counts.keys()])]
+    const total = [...counts.values()].reduce((sum, value) => sum + value, 0)
+    return { total, startedAt: Number(this.setting("usage-started-at", () => String(Math.floor(now / 1000)))),
+      rows: ids.map(id => ({ id, calls: counts.get(id) || 0, registered: accountIds.includes(id),
+        percent: total ? (counts.get(id) || 0) / total * 100 : 0 })) }
   }
   /** A successful password check replaces the account's connection atomically. */
   beginLogin(accountId: string, interactionId = ""): string {

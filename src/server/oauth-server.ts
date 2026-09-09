@@ -182,8 +182,13 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
     res.status(400).send(html("<h1>연결을 다시 시작해주세요</h1><p>로그인 요청이 만료되었거나 올바르지 않습니다. ChatGPT에서 다시 연결해주세요.</p>"))
   })
   const cleanup = setInterval(() => store.cleanup(), 60000).unref()
+  const authenticatedAccounts = new WeakMap<Request, string>()
   return {
     provider, resource,
+    recordToolCalls(req: Request, count: number) {
+      const accountId = authenticatedAccounts.get(req)
+      if (accountId) store.recordToolCalls(accountId, count)
+    },
     challenge(res: Response, insufficientScope = false) {
       res.setHeader("WWW-Authenticate", `Bearer resource_metadata="${issuer}/.well-known/oauth-protected-resource", scope="${LAW_SCOPE}"${insufficientScope ? ', error="insufficient_scope"' : ""}`)
       res.setHeader("Cache-Control", "no-store")
@@ -197,6 +202,7 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
         if (!token || token.isExpired || token.aud !== resource || !token.accountId || !employees.has(token.accountId)
           || !token.grantId || !await provider.Grant.find(token.grantId)) return "invalid"
         if (!token.scopes.has(LAW_SCOPE)) return "scope"
+        authenticatedAccounts.set(req, token.accountId)
         if (req.path === "/mcp") store.recordRequest(token.accountId)
         return "valid"
       } catch { return "invalid" }

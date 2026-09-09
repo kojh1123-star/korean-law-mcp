@@ -350,6 +350,10 @@ export async function startHTTPServer(
 
       await server.connect(transport)
 
+      // Count employee tool-call attempts only after authentication and all admission limits.
+      // Handshakes, tool lists, rejected traffic and shared machine tokens have no employee usage.
+      oauth?.recordToolCalls(req, fallbackCallCount)
+
       // ALS로 요청 단위 API 키 격리 (동시 요청 안전)
       await requestContext.run({
         apiKey,
