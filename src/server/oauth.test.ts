@@ -90,6 +90,16 @@ async function exchange(username = "employee01", keepCookies = false) {
   expect(response.status).toBe(200)
   return tokens
 }
+async function adminLogin(username = "employee02") {
+  cookieJar = new Map()
+  const page = await (await request("/admin/login", {}, true)).text()
+  const csrf = page.match(/name="csrf" value="([^"]+)"/)![1]
+  return request("/admin/login", form({ csrf, username, password }), true)
+}
+async function adminCsrf() {
+  const page = await (await request("/admin", {}, true)).text()
+  return { page, csrf: page.match(/name="csrf" value="([^"]+)"/)![1] }
+}
 
 beforeAll(async () => {
   directory = mkdtempSync(join(tmpdir(), "law-oauth-test-"))
@@ -100,6 +110,7 @@ beforeAll(async () => {
   base = `http://127.0.0.1:${port}`
   resource = `${base}/mcp`
   for (const [key, value] of Object.entries({ NODE_ENV: "test", OAUTH_ENABLED: "1", OAUTH_ISSUER: base,
+    OAUTH_ADMIN_IDS: "employee02",
     OAUTH_DB_PATH: join(directory, "oauth.sqlite"), OAUTH_USERS_JSON: JSON.stringify(await Promise.all(["employee01", "employee02"].map(async id => ({ id, passwordHash: await hashPassword(password) })))),
     MCP_AUTH_TOKEN: "test-only-legacy-token", MCP_HTTP_HOST: "127.0.0.1", FALLBACK_DAILY_CAP: "1000", RATE_LIMIT_RPM: "0" })) vi.stubEnv(key, value)
   server = await startHTTPServer(() => {
@@ -242,6 +253,85 @@ describe("ChatGPT OAuth authentication", () => {
     const tokens = await exchange()
     expect((await request("/oauth/revoke", { ...form({ client_id: clientId, token: tokens.access_token }), headers: { "content-type": "application/x-www-form-urlencoded" } })).status).toBe(200)
     expect((await request("/mcp", { headers: { authorization: `Bearer ${tokens.access_token}` } })).status).toBe(401)
+  })
+  it("requires an explicit administrator login and rejects forged management requests", async () => {
+    cookieJar = new Map()
+    expect((await request("/admin", {}, true)).headers.get("location")).toBe("/admin/login")
+    expect((await request("/admin/accounts", form({ target: "employee01", action: "block" }), true)).status).toBe(401)
+    expect((await adminLogin("employee01")).status).toBe(401)
+    const employeeTokens = await exchange()
+    expect((await request("/admin", { headers: { authorization: `Bearer ${employeeTokens.access_token}` } })).status).toBe(303)
+    expect((await adminLogin()).status).toBe(303)
+    const { page, csrf } = await adminCsrf()
+    expect(page).toContain("법령 MCP 계정 관리")
+    expect(page).not.toContain(password)
+    expect(page).not.toContain("scrypt-v1")
+    expect(page).not.toContain(employeeTokens.access_token)
+    const fields = { csrf, target: "employee01", action: "block" }
+    expect((await request("/admin/accounts", form({ ...fields, csrf: "forged" }), true)).status).toBe(403)
+    expect((await request("/admin/accounts", { ...form(fields), headers: { "content-type": "application/x-www-form-urlencoded", origin: "https://attacker.example" } }, true)).status).toBe(403)
+    expect((await request("/admin/accounts", form({ ...fields, target: "employee02" }), true)).status).toBe(403)
+    expect((await request("/admin/accounts", form({ ...fields, target: "unknown" }), true)).status).toBe(404)
+    expect((await request("/mcp", { headers: { authorization: `Bearer ${employeeTokens.access_token}` } })).status).toBe(405)
+    expect((await request("/admin/logout", form({ csrf }), true)).status).toBe(303)
+    expect((await request("/admin/accounts", form(fields), true)).status).toBe(401)
+  })
+  it("lets an administrator disconnect, block and unblock one employee immediately", async () => {
+    const old = await exchange()
+    const other = await exchange("employee02")
+    const access = (value: string) => request("/mcp", { headers: { authorization: `Bearer ${value}` } })
+    await access(old.access_token)
+    expect((await adminLogin()).status).toBe(303)
+    const adminCookies = new Map(cookieJar)
+    const { page, csrf } = await adminCsrf()
+    expect(page).toContain("최근 5분 요청 계정")
+    const act = async (action: string) => {
+      cookieJar = new Map(adminCookies)
+      return request("/admin/accounts", form({ csrf, target: "employee01", action }), true)
+    }
+    expect((await act("disconnect")).status).toBe(303)
+    expect((await access(old.access_token)).status).toBe(401)
+    expect((await tokenRequest({ grant_type: "refresh_token", refresh_token: old.refresh_token, resource })).status).toBe(400)
+    expect((await access(other.access_token)).status).toBe(405)
+    const reconnected = await exchange()
+    expect((await access(reconnected.access_token)).status).toBe(405)
+    expect((await act("block")).status).toBe(303)
+    expect((await access(reconnected.access_token)).status).toBe(401)
+    const { response } = await startAuthorization()
+    const next = response.headers.get("location")!
+    const loginPage = await (await request(next, {}, true)).text()
+    const loginCsrf = loginPage.match(/name="csrf" value="([^"]+)"/)![1]
+    expect((await request(next, form({ csrf: loginCsrf, username: "employee01", password, action: "login" }), true)).status).toBe(401)
+    const reopened = new OAuthStore(join(directory, "oauth.sqlite"), base)
+    try {
+      expect(reopened.isBlocked("employee01")).toBe(true)
+      expect(reopened.connectionSummary("employee01").connected).toBe(false)
+      expect(reopened.auditLog()[0]).toMatchObject({ actor: "employee02", target: "employee01", action: "block" })
+      expect(() => reopened.beginLogin("employee01")).toThrow()
+    } finally { reopened.close() }
+    expect((await act("unblock")).status).toBe(303)
+    expect((await access(reconnected.access_token)).status).toBe(401)
+    const fresh = await exchange()
+    expect((await access(fresh.access_token)).status).toBe(405)
+    expect((await access(other.access_token)).status).toBe(405)
+  })
+  it("rejects login CSRF and invalidates older administrator sessions", async () => {
+    cookieJar = new Map()
+    const p = await (await request("/admin/login", {}, true)).text()
+    const csrf = p.match(/name="csrf" value="([^"]+)"/)![1]
+    expect((await request("/admin/login", form({ csrf: "forged", username: "employee02", password }), true)).status).toBe(403)
+    expect((await request("/admin/login", { ...form({ csrf, username: "employee02", password }), headers: { "content-type": "application/x-www-form-urlencoded", origin: "null" } }, true)).status).toBe(403)
+    await adminLogin()
+    const oldCookies = new Map(cookieJar)
+    await adminLogin()
+    const newCookies = new Map(cookieJar)
+    cookieJar = oldCookies
+    expect((await request("/admin", {}, true)).status).toBe(303)
+    cookieJar = newCookies
+    expect((await request("/admin", {}, true)).status).toBe(200)
+    const db = new DatabaseSync(join(directory, "oauth.sqlite"))
+    try { db.exec("UPDATE objects SET expires=0 WHERE model='AdminSession'") } finally { db.close() }
+    expect((await request("/admin", {}, true)).status).toBe(303)
   })
   it("checks scope, audience, expiration and password-change revocation for stored tokens", async () => {
     const tokens = await exchange()
