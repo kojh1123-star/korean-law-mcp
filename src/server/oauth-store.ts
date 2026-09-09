@@ -27,6 +27,14 @@ export class OAuthStore {
       CREATE TABLE IF NOT EXISTS active_connections (
         account_id TEXT PRIMARY KEY, login_id TEXT NOT NULL, grant_id TEXT
       );
+      CREATE TABLE IF NOT EXISTS account_controls (
+        account_id TEXT PRIMARY KEY, blocked INTEGER NOT NULL DEFAULT 0,
+        last_login INTEGER, last_request INTEGER
+      );
+      CREATE TABLE IF NOT EXISTS admin_audit (
+        id INTEGER PRIMARY KEY, at INTEGER NOT NULL, actor TEXT NOT NULL,
+        target TEXT NOT NULL, action TEXT NOT NULL
+      );
     `)
     const savedIssuer = this.setting("issuer", () => issuer)
     if (savedIssuer !== issuer) { this.close(); throw new Error("OAuth database issuer differs from OAUTH_ISSUER. Use the original issuer or a new volume.") }
@@ -36,20 +44,65 @@ export class OAuthStore {
     const loginId = randomBytes(32).toString("hex")
     this.db.exec("BEGIN IMMEDIATE")
     try {
+      if (this.isBlocked(accountId)) throw new errors.AccessDenied("Account disabled.")
       this.db.prepare(`INSERT INTO active_connections VALUES(?,?,NULL)
         ON CONFLICT(account_id) DO UPDATE SET login_id=excluded.login_id, grant_id=NULL`).run(accountId, loginId)
       const grants = this.db.prepare("SELECT id FROM objects WHERE model='Grant' AND json_extract(payload,'$.accountId')=?").all(accountId)
       for (const grant of grants) this.revokeGrant(String(grant.id), interactionId)
       this.db.prepare("DELETE FROM objects WHERE model IN ('AccessToken','RefreshToken','AuthorizationCode') AND json_extract(payload,'$.accountId')=?").run(accountId)
+      this.db.prepare(`INSERT INTO account_controls(account_id,last_login) VALUES(?,?)
+        ON CONFLICT(account_id) DO UPDATE SET last_login=excluded.last_login`).run(accountId, Math.floor(Date.now() / 1000))
       this.db.exec("COMMIT")
       return loginId
     } catch (error) { this.db.exec("ROLLBACK"); throw error }
   }
+  isBlocked(accountId: string): boolean {
+    return this.db.prepare("SELECT blocked FROM account_controls WHERE account_id=?").get(accountId)?.blocked === 1
+  }
+  recordRequest(accountId: string) {
+    this.db.prepare(`INSERT INTO account_controls(account_id,last_request) VALUES(?,?)
+      ON CONFLICT(account_id) DO UPDATE SET last_request=excluded.last_request`).run(accountId, Math.floor(Date.now() / 1000))
+  }
+  connectionSummary(accountId: string) {
+    const now = Math.floor(Date.now() / 1000)
+    const controls = this.db.prepare("SELECT blocked,last_login,last_request FROM account_controls WHERE account_id=?").get(accountId)
+    const connected = !this.isBlocked(accountId) && !!this.db.prepare(`SELECT 1 FROM active_connections c
+      JOIN objects g ON g.model='Grant' AND g.id=c.grant_id
+      JOIN objects t ON t.grant_id=c.grant_id AND t.model IN ('AccessToken','RefreshToken')
+      WHERE c.account_id=? AND g.expires>? AND t.expires>?
+      AND (json_extract(t.payload,'$.exp') IS NULL OR json_extract(t.payload,'$.exp')>?)
+      AND json_extract(t.payload,'$.consumed') IS NULL LIMIT 1`).get(accountId, now, now, now)
+    return { id: accountId, blocked: controls?.blocked === 1, connected,
+      lastLogin: controls?.last_login == null ? null : Number(controls.last_login),
+      lastRequest: controls?.last_request == null ? null : Number(controls.last_request) }
+  }
+  manageAccount(actor: string, target: string, action: "disconnect" | "block" | "unblock") {
+    this.db.exec("BEGIN IMMEDIATE")
+    try {
+      if (action !== "unblock") {
+        this.db.prepare("DELETE FROM active_connections WHERE account_id=?").run(target)
+        const grants = this.db.prepare("SELECT id FROM objects WHERE model='Grant' AND json_extract(payload,'$.accountId')=?").all(target)
+        for (const grant of grants) this.revokeGrant(String(grant.id))
+        this.db.prepare(`DELETE FROM objects WHERE (model<>'AdminSession' AND json_extract(payload,'$.accountId')=?)
+          OR (model='Interaction' AND (json_extract(payload,'$.session.accountId')=? OR json_extract(payload,'$.result.login.accountId')=?))`).run(target, target, target)
+      }
+      if (action !== "disconnect") this.db.prepare(`INSERT INTO account_controls(account_id,blocked) VALUES(?,?)
+        ON CONFLICT(account_id) DO UPDATE SET blocked=excluded.blocked`).run(target, action === "block" ? 1 : 0)
+      this.db.prepare("INSERT INTO admin_audit(at,actor,target,action) VALUES(?,?,?,?)").run(Math.floor(Date.now() / 1000), actor, target, action)
+      this.db.exec("COMMIT")
+    } catch (error) { this.db.exec("ROLLBACK"); throw error }
+  }
+  auditLog() {
+    return this.db.prepare("SELECT at,actor,target,action FROM admin_audit ORDER BY id DESC LIMIT 30").all()
+  }
+  revokeAdminSessions(accountId: string) {
+    this.db.prepare("DELETE FROM objects WHERE model='AdminSession' AND json_extract(payload,'$.accountId')=?").run(accountId)
+  }
   isCurrentLogin(accountId: string, loginId: unknown): boolean {
-    return typeof loginId === "string" && !!this.db.prepare("SELECT 1 FROM active_connections WHERE account_id=? AND login_id=?").get(accountId, loginId)
+    return !this.isBlocked(accountId) && typeof loginId === "string" && !!this.db.prepare("SELECT 1 FROM active_connections WHERE account_id=? AND login_id=?").get(accountId, loginId)
   }
   activateGrant(accountId: string, loginId: unknown, grantId: string) {
-    if (typeof loginId !== "string" || this.db.prepare(`UPDATE active_connections SET grant_id=?
+    if (this.isBlocked(accountId) || typeof loginId !== "string" || this.db.prepare(`UPDATE active_connections SET grant_id=?
       WHERE account_id=? AND login_id=? AND (grant_id IS NULL OR grant_id=?)`).run(grantId, accountId, loginId, grantId).changes !== 1) {
       throw new errors.InvalidGrant("This login was replaced. Start a new login.")
     }
@@ -58,6 +111,7 @@ export class OAuthStore {
     if (!["Grant", "AccessToken", "RefreshToken", "AuthorizationCode"].includes(model)) return true
     const grantId = model === "Grant" ? id : payload.grantId
     if (typeof payload.accountId !== "string" || typeof grantId !== "string") return false
+    if (this.isBlocked(payload.accountId)) return false
     return !!this.db.prepare("SELECT 1 FROM active_connections WHERE account_id=? AND grant_id=?").get(payload.accountId, grantId)
   }
   setting(key: string, create: () => string): string {
@@ -101,6 +155,7 @@ export class OAuthStore {
     const now = Math.floor(Date.now() / 1000)
     this.db.prepare("DELETE FROM objects WHERE expires IS NOT NULL AND expires<=?").run(now)
     this.db.prepare("DELETE FROM limits WHERE expires<=?").run(now)
+    this.db.prepare("DELETE FROM admin_audit WHERE at<?").run(now - 90 * 86400)
   }
   private revokeGrant(id: string, preserveInteraction = "") {
     this.db.prepare(`DELETE FROM objects WHERE (grant_id=? OR (model='Grant' AND id=?))
