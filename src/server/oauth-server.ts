@@ -26,9 +26,8 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
   }
   if (!local && !env.OAUTH_DB_PATH) throw new Error("Set OAUTH_DB_PATH to a Railway volume path.")
   if (!local && env.OAUTH_DB_PATH === ":memory:") throw new Error("Production OAuth requires persistent storage.")
-  const employees = readEmployees(env.OAUTH_USERS_JSON)
+  const bootstrapEmployees = readEmployees(env.OAUTH_USERS_JSON)
   const adminIds = new Set((env.OAUTH_ADMIN_IDS || "").split(",").map(id => id.trim()).filter(Boolean))
-  if ([...adminIds].some(id => !employees.has(id))) throw new Error("OAUTH_ADMIN_IDS must name registered employee accounts.")
   const redirects = (env.OAUTH_REDIRECT_URIS || CHATGPT_CALLBACK).split(",").map(x => x.trim())
   if (!redirects.length || redirects.some(uri => {
     try { const u = new URL(uri); return u.protocol !== "https:" || !!u.hash || !!u.username || !!u.password } catch { return true }
@@ -36,6 +35,8 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
   const resource = `${issuer}/mcp`
   const store = new OAuthStore(env.OAUTH_DB_PATH || ":memory:", issuer)
   try {
+  const employees = store.loadEmployees(bootstrapEmployees)
+  if ([...adminIds].some(id => !employees.has(id))) throw new Error("OAUTH_ADMIN_IDS must name registered employee accounts.")
   const fingerprints = Object.fromEntries([...employees].map(([id, employee]) => [id, createHash("sha256").update(employee.passwordHash).digest("hex")]))
   store.synchronizeAccounts(fingerprints)
   const keys = store.keys()
@@ -143,7 +144,7 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
       if (!store.hit(`login:${bucket}`, 10, 300) || !store.hit("login-global", 100, 60)) { res.setHeader("Retry-After", "300"); return res.status(429).send("잠시 후 다시 시도해주세요.") }
       const employee = employees.get(id)
       const valid = await verifyPassword(req.body.password, employee?.passwordHash || dummyHash)
-      if (!employee || !valid || store.isBlocked(id)) return res.status(401).send(html(`<h1>로그인 정보를 확인해주세요</h1><p class="error">아이디·비밀번호 또는 계정 사용 권한을 확인해주세요.</p><a href="/oauth/interaction/${escape(details.uid)}">다시 로그인</a>`))
+      if (!employee || employees.get(id) !== employee || !valid || store.isBlocked(id)) return res.status(401).send(html(`<h1>로그인 정보를 확인해주세요</h1><p class="error">아이디·비밀번호 또는 계정 사용 권한을 확인해주세요.</p><a href="/oauth/interaction/${escape(details.uid)}">다시 로그인</a>`))
       const connectionId = store.beginLogin(employee.id, details.uid)
       return provider.interactionFinished(req, res, { login: { accountId: employee.id, amr: ["pwd"], remember: false, connectionId } }, { mergeWithLastSubmission: false })
     }
