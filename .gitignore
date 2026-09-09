@@ -16,3 +16,7 @@ test-results-*.txt
 .claude/plans/
 promo-video/
 *.tgz
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+oauth-data/

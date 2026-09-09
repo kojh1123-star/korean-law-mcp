@@ -1,0 +1,92 @@
+# 법령 MCP: 직원 로그인과 ChatGPT 연결
+
+기존 법령 MCP에 직원 아이디·비밀번호 로그인을 추가합니다. 기존 도메인과 `/mcp` 주소를 계속 사용합니다. `OAUTH_ENABLED=1`로 설정해야 활성화되며, 설정 전에는 기존 토큰 인증으로 동작합니다.
+
+관리자가 Railway를 한 번 설정하고 계정을 발급하면 직원은 ChatGPT 웹에서 연결하고 로그인합니다. 직원 PC에 프로그램이나 환경변수를 설치할 필요가 없습니다. **코드는 로컬에서 검증했으며, Railway 배포와 실제 ChatGPT 연결은 아래 절차로 별도 확인해야 합니다.**
+
+## 1. 준비물
+
+- Railway의 `kojh1123-star/korean-law-mcp` 서비스 편집 권한과 이 변경을 포함한 GitHub 코드.
+- 서비스에 연결된 **영구 볼륨**: 마운트 경로 `/data`, 서비스 복제본 **1개**.
+- 직원별 아이디와 12자 이상의 비밀번호. 관리자도 별도 직원 계정을 사용합니다.
+- 기존 `LAW_OC`, `MCP_AUTH_TOKEN`, 사용량 제한 설정.
+
+볼륨에는 OAuth 서명키·클라이언트 등록·세션·토큰이 보관됩니다. Docker 시작 스크립트가 `/data/oauth` 디렉터리 권한을 준비한 뒤 일반 사용자로 실행합니다. 볼륨을 삭제하면 직원들은 다시 연결해야 합니다. 여러 복제본은 공유 DB 어댑터가 필요합니다. 볼륨 지원 여부와 비용은 Railway 프로젝트 요금제에서 확인하세요.
+
+## 2. 직원 계정 발급
+
+관리자 PC에서 이 저장소 폴더를 열고 Node 22.13 이상으로 실행합니다. 추가 패키지 설치는 필요 없습니다.
+
+```powershell
+node scripts/oauth-account.mjs
+```
+
+아이디와 비밀번호를 입력합니다. 비밀번호는 화면에 나오지 않으며 파일·명령 기록에 저장하지 않습니다. 출력된 JSON에는 아이디와 scrypt 해시만 포함됩니다. **JSON을 Railway Variables의 `OAUTH_USERS_JSON` 값에 직접 붙여넣으세요.** 직원에게는 별도의 회사 전달 수단으로 아이디·비밀번호를 제공합니다.
+
+직원 추가 시 기존 JSON 배열에 새 항목을 합칩니다. 기존 항목을 삭제하면 다음 재배포부터 해당 직원이 차단됩니다. 비밀번호 변경은 같은 아이디로 새 해시를 발급해 교체합니다. 계정 삭제·비밀번호 교체 시 기존 세션과 토큰도 다음 시작 시 폐기합니다. 아이디를 다른 직원에게 재사용하지 마세요.
+
+## 3. Railway 환경변수
+
+| 이름 | 값 / 설정 방법 |
+|---|---|
+| `OAUTH_ENABLED` | `1` |
+| `OAUTH_ISSUER` | `https://korean-law-mcp-production-e84f.up.railway.app` — 마지막 `/` 없이 입력 |
+| `OAUTH_USERS_JSON` | 계정 발급 명령이 출력한 JSON |
+| `OAUTH_DB_PATH` | `/data/oauth/oauth.sqlite` — Docker 기본값 |
+| `TRUST_PROXY` | `1` — Railway 프록시 1단 구성 기준 |
+| `MCP_AUTH_TOKEN` | 기존 값 유지. OAuth Client Secret으로 사용하지 않습니다. |
+| `LAW_OC` | 기존 값 유지 |
+| `FALLBACK_DAILY_CAP` | 기존 양수 값 유지. `0`이면 서버 법제처 키를 사용하는 도구 호출이 차단됩니다. |
+| `ALLOW_QUERY_API_KEY` | 직원 OAuth 사용에는 필요하지 않으며 `0` 권장 |
+
+서명키·쿠키 키는 처음 실행할 때 자동 생성해 볼륨에 보관합니다. Google·Microsoft·Auth0 계정은 필요 없습니다.
+
+기본 콜백은 `https://chatgpt.com/connector_platform_oauth_redirect`를 정확히 허용합니다. ChatGPT 관리 화면이 다른 콜백을 표시한다면 **그 전체 주소를** `OAUTH_REDIRECT_URIS`에 등록합니다. 여러 주소는 쉼표로 구분하며 와일드카드는 금지합니다.
+
+로그인 후 발급된 OAuth 토큰은 법제처로 전달하지 않습니다. 법령 조회에는 서버의 `LAW_OC`를 사용합니다.
+
+## 4. 배포와 확인
+
+1. GitHub 변경을 검토하고 Railway 배포 브랜치에 반영합니다.
+2. `/data` 볼륨과 위 변수를 설정하고 배포합니다. Dockerfile을 사용하고 별도 시작 명령은 비워 기본 명령을 사용합니다.
+3. 관리자 PC에서 공개 설정을 검사합니다. 인증값은 필요하지 않습니다.
+
+```powershell
+node scripts/check-oauth.mjs https://korean-law-mcp-production-e84f.up.railway.app
+```
+
+`PASS`는 메타데이터·인증 발견 경로가 동작한다는 뜻입니다. 실제 직원 로그인과 조회는 다음 단계에서 확인합니다.
+
+## 5. 직원의 ChatGPT 웹 연결
+
+1. 사용자 지정 MCP를 추가할 수 있는 계정에서 개발자 모드를 켜고 플러그인/MCP 추가 화면을 엽니다.
+2. 이름은 `회사 법령 조회`, MCP 서버 URL은 다음을 입력합니다.
+
+```text
+https://korean-law-mcp-production-e84f.up.railway.app/mcp
+```
+
+3. 인증은 **OAuth**, 클라이언트 등록은 **자동 등록(DCR)**을 사용합니다. Client ID·Secret을 직접 발급하거나 입력할 필요가 없습니다. 이 구현은 CIMD를 지원하지 않습니다.
+4. 직원 아이디·비밀번호로 로그인한 뒤 `허용`을 누릅니다.
+5. 대화에서 도구를 선택하고 `법령 MCP로 폐기물관리법을 검색해줘`처럼 조회합니다.
+
+사전 등록된 공개 Client ID `chatgpt-law`도 지원하며 Secret 없이 PKCE를 사용합니다. 연결 화면에서 이를 지원하지 않으면 값을 임의로 채우지 말고 DCR을 사용합니다.
+
+**OAuth를 추가해도 ChatGPT Free의 사용자 지정 MCP 추가 권한이 생기는 것은 아닙니다.** 2026-09-09 확인한 OpenAI 문서 기준 Plus 등 지원 요금제가 필요합니다. 최종 가능 여부는 직원 계정의 설정 화면에서 확인합니다.
+
+## 6. 운영과 되돌리기
+
+- 비밀번호 분실: 같은 아이디의 해시를 교체하고 재배포합니다. 직원은 다시 연결합니다.
+- 퇴사자 차단: `OAUTH_USERS_JSON`에서 해당 항목을 제거하고 재배포합니다.
+- 접근 토큰 15분, 인증 코드 2분, 로그인·동의 절차 10분, 연결 허용 최대 7일입니다. 갱신 토큰은 사용 시 교체되며 재사용은 거부합니다.
+- 재배포 시 볼륨과 `OAUTH_ISSUER`를 유지합니다. 다른 issuer로 기존 DB를 열면 시작을 거부합니다.
+- OAuth 사용 중단은 `OAUTH_ENABLED=0`으로 변경 후 재배포합니다. 기존 `MCP_AUTH_TOKEN` 연결은 유지됩니다. 기존 DB는 남으므로 특정 계정 차단은 해당 계정을 삭제한 뒤 OAuth 활성 상태로 시작해야 합니다.
+- 비밀번호·법제처 인증값·토큰·DB 파일을 진단 자료나 채팅에 첨부하지 않습니다.
+
+## 근거와 검증 범위
+
+- [OpenAI OAuth 인증 규격](https://developers.openai.com/plugins/build/auth): 공개 메타데이터, PKCE S256, 리소스 결합, DCR, issuer 응답.
+- [OpenAI 개발자 모드](https://developers.openai.com/api/docs/guides/developer-mode): 연결과 계정 지원 범위.
+- [oidc-provider 공식 문서](https://github.com/panva/node-oidc-provider/blob/main/docs/README.md): OAuth 프로토콜 라이브러리. 버전 9.12.2를 고정합니다.
+
+자동 테스트는 로그인·동의·토큰 교환·MCP 호출, 잘못된 비밀번호/CSRF/리소스/PKCE, 코드·갱신 토큰 재사용, 기존 토큰 연결과 영구 저장소를 검증합니다. 실제 ChatGPT와 Railway에서의 최종 연결은 배포 후 확인해야 합니다. 공식 문서 확인일 2026-09-09, 규격 근거의 신뢰도 높음.
