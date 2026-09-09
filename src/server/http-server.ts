@@ -7,6 +7,9 @@
  */
 
 import express from "express"
+import { SERVICES, SERVICE_IDS, serviceForPath } from "./services.js"
+import { createG2bServer } from "../integrations/g2b/server.mjs"
+import { createKosisServer } from "../integrations/kosis/server.js"
 import { timingSafeEqual } from "node:crypto"
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js"
@@ -155,7 +158,7 @@ export async function startHTTPServer(
       res.locals.mcpAccessAuthenticated = true
       return next()
     }
-    oauth?.challenge(res, oauthResult === "scope")
+    oauth?.challenge(res, oauthResult === "scope", req.path)
     res.status(oauthResult === "scope" ? 403 : 401).json({
       jsonrpc: "2.0",
       error: { code: -32001, message: "Unauthorized." },
@@ -194,7 +197,7 @@ export async function startHTTPServer(
 
     if (rateLimitRpm === 0) return next()
 
-    const ip = req.ip || req.socket.remoteAddress || "unknown"
+    const ip = `${serviceForPath(req.path) || "law"}:${req.ip || req.socket.remoteAddress || "unknown"}`
     const now = Date.now()
     let bucket = rateBuckets.get(ip)
 
@@ -250,6 +253,8 @@ export async function startHTTPServer(
       transport: "streamable-http (stateless)",
       endpoints: {
         mcp: "/mcp",
+        g2b: "/g2b/mcp",
+        kosis: "/kosis/mcp",
         health: "/health",
       },
       tools: {
@@ -283,7 +288,10 @@ export async function startHTTPServer(
   }
 
   // POST /mcp - stateless 요청 처리
-  app.post("/mcp", async (req, res) => {
+  const mcpPaths = SERVICE_IDS.map(id => SERVICES[id].path)
+  app.post(mcpPaths, async (req, res) => {
+    const service = serviceForPath(req.path)!
+    res.once("finish", () => oauth?.serviceResult(service, res.statusCode >= 400))
     // Extract API key: header > URL query
     // 쿼리스트링 키는 프록시/엣지 액세스 로그에 평문으로 남으므로 헤더 사용 권장.
     // ALLOW_QUERY_API_KEY=0 으로 쿼리 경로를 차단할 수 있다 (폐쇄망 권장).
@@ -304,7 +312,7 @@ export async function startHTTPServer(
     // initialize/tools/list 등 핸드셰이크는 법제처 쿼터를 안 쓰므로 tools/call만 게이트
     // (핸드셰이크까지 429로 막으면 claude.ai 커넥터가 도구 목록 자체를 못 싣는다)
     const fallbackCallCount = countToolCalls(req.body)
-    if (!apiKey && fallbackCallCount > 0) {
+    if (service === "law" && !apiKey && fallbackCallCount > 0) {
       const verdict = fallbackAllowed(fallbackCallCount)
       if (!verdict.ok) {
         res.setHeader("Retry-After", String(verdict.retryAfterSec))
@@ -326,7 +334,10 @@ export async function startHTTPServer(
     let transport: StreamableHTTPServerTransport | undefined
 
     try {
-      server = createServer(config.executionLimits)
+      const principal = oauth?.principal(req)
+      server = service === "law" ? createServer(config.executionLimits)
+        : service === "g2b" ? createG2bServer()
+        : createKosisServer(principal && oauth ? (bytes, name) => oauth.saveDownload(principal.accountId, bytes, name) : undefined)
       transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,  // ← stateless 모드
         enableJsonResponse: true,
@@ -357,7 +368,7 @@ export async function startHTTPServer(
       // ALS로 요청 단위 API 키 격리 (동시 요청 안전)
       await requestContext.run({
         apiKey,
-        signal: connectionAbort.signal,
+        signal: AbortSignal.any([connectionAbort.signal, AbortSignal.timeout(120000)]),
         budget: new RequestExecutionBudget(config.executionLimits),
       }, async () => {
         await transport!.handleRequest(req, res, req.body)
@@ -381,7 +392,7 @@ export async function startHTTPServer(
   })
 
   // GET/DELETE /mcp - stateless 모드에서는 불허 (MCP 공식 예제와 동일)
-  app.get("/mcp", (req, res) => {
+  app.get(mcpPaths, (req, res) => {
     res.status(405).json({
       jsonrpc: "2.0",
       error: { code: -32000, message: "Method not allowed. Server runs in stateless mode." },
@@ -389,7 +400,7 @@ export async function startHTTPServer(
     })
   })
 
-  app.delete("/mcp", (req, res) => {
+  app.delete(mcpPaths, (req, res) => {
     res.status(405).json({
       jsonrpc: "2.0",
       error: { code: -32000, message: "Method not allowed. Server runs in stateless mode." },

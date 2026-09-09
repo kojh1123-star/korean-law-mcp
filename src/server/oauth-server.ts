@@ -4,10 +4,13 @@ import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypt
 import { OAuthStore } from "./oauth-store.js"
 import { hashPassword, readEmployees, verifyPassword } from "./oauth-accounts.js"
 import { installAdmin } from "./oauth-admin.js"
+import { installEmployeeDownloads } from "./employee-downloads.js"
+import { AccountBackups } from "./oauth-backups.js"
+import { SERVICES, SERVICE_IDS, serviceForPath, type ServiceId } from "./services.js"
 
 export const LAW_SCOPE = "law:read"
 const DISCOVERY_PATHS = new Set(["/.well-known/openid-configuration", "/.well-known/oauth-authorization-server"])
-const METADATA_PATHS = ["/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"]
+const METADATA_PATHS = ["/.well-known/oauth-protected-resource", ...SERVICE_IDS.map(id => "/.well-known/oauth-protected-resource" + SERVICES[id].path)]
 const CHATGPT_CALLBACK = "https://chatgpt.com/connector_platform_oauth_redirect"
 const escape = (value: unknown) => String(value).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!))
 
@@ -33,6 +36,13 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
     try { const u = new URL(uri); return u.protocol !== "https:" || !!u.hash || !!u.username || !!u.password } catch { return true }
   })) throw new Error("OAUTH_REDIRECT_URIS must contain exact HTTPS callback URLs.")
   const resource = `${issuer}/mcp`
+  const serviceResource = (id: ServiceId) => issuer + SERVICES[id].path
+  const requestedService = (value: unknown): ServiceId => {
+    const requested = Array.isArray(value) && value.length === 1 ? value[0] : value
+    const service = SERVICE_IDS.find(id => serviceResource(id) === (requested || resource))
+    if (!service) throw new errors.InvalidTarget()
+    return service
+  }
   const store = new OAuthStore(env.OAUTH_DB_PATH || ":memory:", issuer)
   try {
   const employees = store.loadEmployees(bootstrapEmployees)
@@ -56,7 +66,7 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
     responseTypes: ["code"],
     clientAuthMethods: ["none", "client_secret_post", "client_secret_basic"],
     clientBasedCORS: (_ctx, origin, client) => client.redirectUris?.some(uri => new URL(uri).origin === origin) ?? false,
-    scopes: ["openid", "offline_access", LAW_SCOPE],
+    scopes: ["openid", "offline_access", ...SERVICE_IDS.map(id => SERVICES[id].scope)],
     claims: { openid: ["sub"] },
     features: {
       devInteractions: { enabled: false },
@@ -69,8 +79,8 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
         defaultResource: () => resource,
         useGrantedResource: () => true,
         getResourceServerInfo: (_ctx, requested) => {
-          if (requested !== resource) throw new errors.InvalidTarget()
-          return { scope: LAW_SCOPE, audience: resource, accessTokenFormat: "opaque", accessTokenTTL: 900 }
+          const service = requestedService(requested)
+          return { scope: SERVICES[service].scope, audience: serviceResource(service), accessTokenFormat: "opaque", accessTokenTTL: 900 }
         },
       },
     },
@@ -99,7 +109,10 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
   const callback = provider.callback()
   const csrf = (uid: string) => createHmac("sha256", keys.cookie).update(`interaction:${uid}`).digest("hex")
   const formParser = express.urlencoded({ extended: false, limit: "8kb", parameterLimit: 8 })
-  installAdmin(app, { issuer, local, employees, store, secret: keys.cookie, dummyHash, adminIds })
+  const backups = env.OAUTH_DB_PATH && env.OAUTH_DB_PATH !== ":memory:" ? new AccountBackups(store, issuer, env.OAUTH_DB_PATH, employees) : undefined
+  await backups?.daily().catch(() => console.error("[backup] Account backup failed."))
+  const downloads = installEmployeeDownloads(app, { issuer, local, store, employees, secret: keys.cookie, dummyHash })
+  installAdmin(app, { issuer, local, employees, store, secret: keys.cookie, dummyHash, adminIds, backups, bootstrapEmployees, adminRoots: configuredAdminIds })
 
   app.use((req, res, next) => {
     if (!req.path.startsWith("/oauth/") && !DISCOVERY_PATHS.has(req.path) && !METADATA_PATHS.includes(req.path)) return next()
@@ -120,20 +133,26 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
     }
     next()
   })
-  app.get(METADATA_PATHS, (_req, res) => res.json({ resource, authorization_servers: [issuer], scopes_supported: [LAW_SCOPE], bearer_methods_supported: ["header"] }))
+  app.get(METADATA_PATHS, (req, res) => {
+    const service = serviceForPath(req.path.replace("/.well-known/oauth-protected-resource", "")) || "law"
+    res.json({ resource: serviceResource(service), authorization_servers: [issuer], scopes_supported: [SERVICES[service].scope], bearer_methods_supported: ["header"] })
+  })
 
   app.get("/oauth/interaction/:uid", async (req, res) => {
     const details = await provider.interactionDetails(req, res)
+    const service = requestedService(details.params.resource)
+    const serviceName = SERVICES[service].name
     const fields = `<input type="hidden" name="csrf" value="${csrf(details.uid)}">`
     if (details.prompt.name === "login") {
-      res.send(html(`<h1>법령 MCP 로그인</h1><p>관리자가 발급한 직원 계정으로 로그인해주세요.</p><p><small>같은 계정의 기존 연결은 새 로그인이 성공하면 종료됩니다.</small></p><form method="post" action="/oauth/interaction/${escape(details.uid)}">${fields}<label for="username">아이디</label><input id="username" name="username" autocomplete="username" maxlength="64" required><label for="password">비밀번호</label><input id="password" name="password" type="password" autocomplete="current-password" maxlength="256" required><button name="action" value="login">로그인</button></form>`))
+      res.send(html(`<h1>${serviceName} MCP 로그인</h1><p>관리자가 발급한 직원 계정으로 로그인해주세요.</p><p><small>같은 서비스의 기존 연결은 새 로그인이 성공하면 종료됩니다. 다른 서비스 연결은 유지됩니다.</small></p><form method="post" action="/oauth/interaction/${escape(details.uid)}">${fields}<label for="username">아이디</label><input id="username" name="username" autocomplete="username" maxlength="64" required><label for="password">비밀번호</label><input id="password" name="password" type="password" autocomplete="current-password" maxlength="256" required><button name="action" value="login">로그인</button></form>`))
     } else if (details.prompt.name === "consent" && details.session && employees.has(details.session.accountId)) {
       const client = await provider.Client.find(String(details.params.client_id))
-      res.send(html(`<h1>법령 조회 연결 허용</h1><p><strong>${escape(client?.clientName || "MCP 클라이언트")}</strong>가 <strong>${escape(details.session.accountId)}</strong> 계정으로 법령·판례 조회 도구를 사용하도록 허용합니다.</p><p><small>서버의 법제처 인증값과 직원 비밀번호는 ChatGPT에 전달되지 않습니다.</small></p><form method="post" action="/oauth/interaction/${escape(details.uid)}">${fields}<button name="action" value="consent">허용</button><button name="action" value="deny">취소</button></form>`))
+      res.send(html(`<h1>${serviceName} 조회 연결 허용</h1><p><strong>${escape(client?.clientName || "MCP 클라이언트")}</strong>가 <strong>${escape(details.session.accountId)}</strong> 계정으로 ${serviceName} 조회 도구를 사용하도록 허용합니다.</p><p><small>서버의 API 인증키와 직원 비밀번호는 ChatGPT에 전달되지 않습니다.</small></p><form method="post" action="/oauth/interaction/${escape(details.uid)}">${fields}<button name="action" value="consent">허용</button><button name="action" value="deny">취소</button></form>`))
     } else { res.status(400).send(html("<h1>연결을 다시 시작해주세요</h1>")) }
   })
   app.post("/oauth/interaction/:uid", formParser, async (req, res) => {
     const details = await provider.interactionDetails(req, res)
+    const service = requestedService(details.params.resource)
     const expected = csrf(details.uid)
     const submitted = req.body?.csrf
     if (req.get("origin") !== issuer || typeof submitted !== "string" || !/^[a-f0-9]{64}$/.test(submitted)
@@ -145,13 +164,13 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
       if (!store.hit(`login:${bucket}`, 10, 300) || !store.hit("login-global", 100, 60)) { res.setHeader("Retry-After", "300"); return res.status(429).send("잠시 후 다시 시도해주세요.") }
       const employee = employees.get(id)
       const valid = await verifyPassword(req.body.password, employee?.passwordHash || dummyHash)
-      if (!employee || employees.get(id) !== employee || !valid || store.isBlocked(id)) return res.status(401).send(html(`<h1>로그인 정보를 확인해주세요</h1><p class="error">아이디·비밀번호 또는 계정 사용 권한을 확인해주세요.</p><a href="/oauth/interaction/${escape(details.uid)}">다시 로그인</a>`))
-      const connectionId = store.beginLogin(employee.id, details.uid)
+      if (!employee || employees.get(id) !== employee || !valid || !store.canUse(id, service)) return res.status(401).send(html(`<h1>로그인 정보를 확인해주세요</h1><p class="error">아이디·비밀번호 또는 계정 사용 권한을 확인해주세요.</p><a href="/oauth/interaction/${escape(details.uid)}">다시 로그인</a>`))
+      const connectionId = store.beginLogin(employee.id, details.uid, service)
       return provider.interactionFinished(req, res, { login: { accountId: employee.id, amr: ["pwd"], remember: false, connectionId } }, { mergeWithLastSubmission: false })
     }
     if (details.prompt.name === "consent" && req.body.action === "consent" && details.session && employees.has(details.session.accountId)) {
       const connectionId = details.lastSubmission?.login?.connectionId
-      if (!store.isCurrentLogin(details.session.accountId, connectionId)) return res.status(409).send(html("<h1>다른 곳에서 새로 로그인했습니다</h1><p>이 연결은 종료되었습니다. ChatGPT에서 다시 연결해주세요.</p>"))
+      if (!store.isCurrentLogin(details.session.accountId, connectionId, service)) return res.status(409).send(html("<h1>다른 곳에서 새로 로그인했거나 권한이 변경되었습니다</h1><p>이 연결은 종료되었습니다. ChatGPT에서 다시 연결해주세요.</p>"))
       const grant = details.grantId ? await provider.Grant.find(details.grantId) : new provider.Grant({ accountId: details.session.accountId, clientId: String(details.params.client_id) })
       if (!grant) return res.status(400).send("Invalid grant.")
       const prompt = details.prompt.details
@@ -159,11 +178,11 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
       if (prompt.missingOIDCClaims) grant.addOIDCClaims(prompt.missingOIDCClaims as string[])
       const resources = prompt.missingResourceScopes as Record<string, string[]> | undefined
       for (const [aud, scopes] of Object.entries(resources || {})) {
-        if (aud !== resource || scopes.some(scope => scope !== LAW_SCOPE)) return res.status(400).send("Invalid scope.")
+        if (aud !== serviceResource(service) || scopes.some(scope => scope !== SERVICES[service].scope)) return res.status(400).send("Invalid scope.")
         grant.addResourceScope(aud, scopes.join(" "))
       }
       grant.jti ||= randomBytes(32).toString("base64url")
-      store.activateGrant(details.session.accountId, connectionId, grant.jti)
+      store.activateGrant(details.session.accountId, connectionId, grant.jti, service)
       const grantId = await grant.save()
       return provider.interactionFinished(req, res, { consent: { grantId } }, { mergeWithLastSubmission: true })
     }
@@ -184,15 +203,20 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
     res.status(400).send(html("<h1>연결을 다시 시작해주세요</h1><p>로그인 요청이 만료되었거나 올바르지 않습니다. ChatGPT에서 다시 연결해주세요.</p>"))
   })
   const cleanup = setInterval(() => store.cleanup(), 60000).unref()
-  const authenticatedAccounts = new WeakMap<Request, string>()
+  const backupTimer = setInterval(() => { void backups?.daily().catch(() => console.error("[backup] Account backup failed.")) }, 3600000).unref()
+  const authenticatedAccounts = new WeakMap<Request, { accountId: string; service: ServiceId }>()
   return {
     provider, resource,
+    saveDownload: downloads.save,
+    principal(req: Request) { return authenticatedAccounts.get(req) },
+    serviceResult(service: ServiceId, failed: boolean) { store.serviceResult(service, failed) },
     recordToolCalls(req: Request, count: number) {
-      const accountId = authenticatedAccounts.get(req)
-      if (accountId) store.recordToolCalls(accountId, count)
+      const principal = authenticatedAccounts.get(req)
+      if (principal) store.recordToolCalls(principal.accountId, count, Date.now(), principal.service)
     },
-    challenge(res: Response, insufficientScope = false) {
-      res.setHeader("WWW-Authenticate", `Bearer resource_metadata="${issuer}/.well-known/oauth-protected-resource", scope="${LAW_SCOPE}"${insufficientScope ? ', error="insufficient_scope"' : ""}`)
+    challenge(res: Response, insufficientScope = false, path = "/mcp") {
+      const service = serviceForPath(path) || "law"
+      res.setHeader("WWW-Authenticate", `Bearer resource_metadata="${issuer}/.well-known/oauth-protected-resource${service === "law" ? "" : SERVICES[service].path}", scope="${SERVICES[service].scope}"${insufficientScope ? ', error="insufficient_scope"' : ""}`)
       res.setHeader("Cache-Control", "no-store")
     },
     async authenticate(req: Request): Promise<"valid" | "invalid" | "scope"> {
@@ -201,15 +225,16 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
       try {
         // Opaque tokens are looked up only in this issuer's persistent store, then checked against the resource and live grant.
         const token = await provider.AccessToken.find(match[1])
-        if (!token || token.isExpired || token.aud !== resource || !token.accountId || !employees.has(token.accountId)
+        const service = serviceForPath(req.path)
+        if (!service || !token || token.isExpired || token.aud !== serviceResource(service) || !token.accountId || !employees.has(token.accountId)
           || !token.grantId || !await provider.Grant.find(token.grantId)) return "invalid"
-        if (!token.scopes.has(LAW_SCOPE)) return "scope"
-        authenticatedAccounts.set(req, token.accountId)
-        if (req.path === "/mcp") store.recordRequest(token.accountId)
+        if (!token.scopes.has(SERVICES[service].scope) || !store.canUse(token.accountId, service)) return "scope"
+        authenticatedAccounts.set(req, { accountId: token.accountId, service })
+        store.recordRequest(token.accountId)
         return "valid"
       } catch { return "invalid" }
     },
-    close() { clearInterval(cleanup); store.close() },
+    close() { clearInterval(cleanup); clearInterval(backupTimer); downloads.close(); store.close() },
   }
   } catch (error) { store.close(); throw error }
 }
