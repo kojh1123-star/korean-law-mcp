@@ -1,4 +1,5 @@
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest"
+import { DatabaseSync } from "node:sqlite"
 import { createHash, randomBytes } from "node:crypto"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -37,8 +38,8 @@ async function request(path: string, options: RequestInit = {}, cookies = false)
 const form = (values: Record<string, string>) => ({ method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", origin: base }, body: new URLSearchParams(values) })
 const tokenRequest = (values: Record<string, string>) => request("/oauth/token", { ...form({ client_id: clientId, ...values }), headers: { "content-type": "application/x-www-form-urlencoded" } })
 
-async function startAuthorization(overrides: Record<string, string> = {}) {
-  cookieJar = new Map()
+async function startAuthorization(overrides: Record<string, string> = {}, keepCookies = false) {
+  if (!keepCookies) cookieJar = new Map()
   const verifier = randomBytes(32).toString("base64url")
   const params = new URLSearchParams({ client_id: clientId, redirect_uri: callback, response_type: "code",
     scope: "openid offline_access law:read", resource, state: "test-state",
@@ -46,8 +47,8 @@ async function startAuthorization(overrides: Record<string, string> = {}) {
   const response = await request(`/oauth/authorize?${params}`, {}, true)
   return { verifier, response }
 }
-async function authorize() {
-  const { verifier, response } = await startAuthorization()
+async function login(username = "employee01", keepCookies = false) {
+  const { verifier, response } = await startAuthorization({}, keepCookies)
   expect(response.status).toBe(303)
   let next = response.headers.get("location")!
   let page = await request(next, {}, true)
@@ -55,7 +56,7 @@ async function authorize() {
   let body = await page.text()
   expect(body).toContain("법령 MCP 로그인")
   const csrf = body.match(/name="csrf" value="([^"]+)"/)![1]
-  let submitted = await request(next, form({ csrf, username: "employee01", password, action: "login" }), true)
+  let submitted = await request(next, form({ csrf, username, password, action: "login" }), true)
   expect(submitted.status).toBe(303)
   next = submitted.headers.get("location")!
   let resume = await request(next, {}, true)
@@ -66,9 +67,13 @@ async function authorize() {
   body = await page.text()
   expect(body).toContain("법령 조회 연결 허용")
   const consentCsrf = body.match(/name="csrf" value="([^"]+)"/)![1]
-  submitted = await request(next, form({ csrf: consentCsrf, action: "consent" }), true)
+  return { next, consentCsrf, verifier }
+}
+async function authorize(username = "employee01", keepCookies = false) {
+  const { next, consentCsrf, verifier } = await login(username, keepCookies)
+  const submitted = await request(next, form({ csrf: consentCsrf, action: "consent" }), true)
   expect(submitted.status).toBe(303)
-  resume = await request(submitted.headers.get("location")!, {}, true)
+  const resume = await request(submitted.headers.get("location")!, {}, true)
   expect(resume.status).toBe(303)
   const location = new URL(resume.headers.get("location")!)
   expect(location.origin + location.pathname).toBe(callback)
@@ -78,8 +83,8 @@ async function authorize() {
   expect(code).toBeTruthy()
   return { code, verifier }
 }
-async function exchange() {
-  const { code, verifier } = await authorize()
+async function exchange(username = "employee01", keepCookies = false) {
+  const { code, verifier } = await authorize(username, keepCookies)
   const response = await tokenRequest({ grant_type: "authorization_code", code, code_verifier: verifier, redirect_uri: callback, resource })
   const tokens = await response.json()
   expect(response.status).toBe(200)
@@ -95,7 +100,7 @@ beforeAll(async () => {
   base = `http://127.0.0.1:${port}`
   resource = `${base}/mcp`
   for (const [key, value] of Object.entries({ NODE_ENV: "test", OAUTH_ENABLED: "1", OAUTH_ISSUER: base,
-    OAUTH_DB_PATH: join(directory, "oauth.sqlite"), OAUTH_USERS_JSON: JSON.stringify([{ id: "employee01", passwordHash: await hashPassword(password) }]),
+    OAUTH_DB_PATH: join(directory, "oauth.sqlite"), OAUTH_USERS_JSON: JSON.stringify(await Promise.all(["employee01", "employee02"].map(async id => ({ id, passwordHash: await hashPassword(password) })))),
     MCP_AUTH_TOKEN: "test-only-legacy-token", MCP_HTTP_HOST: "127.0.0.1", FALLBACK_DAILY_CAP: "1000", RATE_LIMIT_RPM: "0" })) vi.stubEnv(key, value)
   server = await startHTTPServer(() => {
     const s = new Server({ name: "oauth-test", version: "1" }, { capabilities: { tools: {} } })
@@ -111,6 +116,11 @@ beforeAll(async () => {
   expect(registration.status).toBe(201)
   clientId = client.client_id
 }, 20000)
+beforeEach(() => {
+  // Independent scenarios must not consume each other's login-rate budget.
+  const db = new DatabaseSync(join(directory, "oauth.sqlite"))
+  try { db.exec("DELETE FROM limits") } finally { db.close() }
+})
 afterAll(async () => {
   if (server) await new Promise<void>(resolve => server.close(() => resolve()))
   vi.unstubAllEnvs()
@@ -185,6 +195,49 @@ describe("ChatGPT OAuth authentication", () => {
     expect((await request("/mcp", { headers: { "x-mcp-token": "test-only-legacy-token" } })).status).toBe(405)
     expect((await request("/mcp", { headers: { authorization: "Bearer invented-token" } })).status).toBe(401)
   })
+  it("replaces only the same employee on successful password login and rejects old refresh tokens", async () => {
+    const old = await exchange()
+    const other = await exchange("employee02")
+    const access = (token: string) => request("/mcp", { headers: { authorization: `Bearer ${token}` } })
+    const { response } = await startAuthorization()
+    const location = response.headers.get("location")!
+    const page = await (await request(location, {}, true)).text()
+    const csrf = page.match(/name="csrf" value="([^"]+)"/)![1]
+    expect((await request(location, form({ csrf, username: "employee01", password: "wrong", action: "login" }), true)).status).toBe(401)
+    expect((await access(old.access_token)).status).toBe(405)
+    const pending = await login()
+    // Revocation happens on password success, before clicking consent.
+    expect((await access(old.access_token)).status).toBe(401)
+    expect((await tokenRequest({ grant_type: "refresh_token", refresh_token: old.refresh_token, resource })).status).toBe(400)
+    expect((await access(other.access_token)).status).toBe(405)
+    const consent = await request(pending.next, form({ csrf: pending.consentCsrf, action: "consent" }), true)
+    const resumed = await request(consent.headers.get("location")!, {}, true)
+    const code = new URL(resumed.headers.get("location")!).searchParams.get("code")!
+    const freshResponse = await tokenRequest({ grant_type: "authorization_code", code, code_verifier: pending.verifier, redirect_uri: callback, resource })
+    expect(freshResponse.status).toBe(200)
+    const fresh = await freshResponse.json()
+    expect((await access(fresh.access_token)).status).toBe(405)
+    expect((await tokenRequest({ grant_type: "refresh_token", refresh_token: fresh.refresh_token, resource })).status).toBe(200)
+  })
+  it("rejects an older pending consent and unexchanged code after another login", async () => {
+    const pending = await login()
+    const oldCookies = new Map(cookieJar)
+    const unexchanged = await authorize()
+    const latest = await exchange()
+    cookieJar = oldCookies
+    expect((await request(pending.next, form({ csrf: pending.consentCsrf, action: "consent" }), true)).status).toBe(409)
+    expect((await tokenRequest({ grant_type: "authorization_code", code: unexchanged.code, code_verifier: unexchanged.verifier, redirect_uri: callback, resource })).status).toBe(400)
+    expect((await request("/mcp", { headers: { authorization: `Bearer ${latest.access_token}` } })).status).toBe(405)
+  })
+  it("requires a fresh password even when a previous browser session cookie exists", async () => {
+    const old = await exchange()
+    const current = await exchange("employee01", true)
+    expect((await request("/mcp", { headers: { authorization: `Bearer ${old.access_token}` } })).status).toBe(401)
+    expect((await request("/mcp", { headers: { authorization: `Bearer ${current.access_token}` } })).status).toBe(405)
+    const { response } = await startAuthorization({}, true)
+    const page = await (await request(response.headers.get("location")!, {}, true)).text()
+    expect(page).toContain("법령 MCP 로그인")
+  })
   it("revokes an access token through the OAuth revocation endpoint", async () => {
     const tokens = await exchange()
     expect((await request("/oauth/revoke", { ...form({ client_id: clientId, token: tokens.access_token }), headers: { "content-type": "application/x-www-form-urlencoded" } })).status).toBe(200)
@@ -213,6 +266,33 @@ describe("ChatGPT OAuth authentication", () => {
 })
 
 describe("credentials and persistent OAuth storage", () => {
+  it("persists the latest connection and fences stale writes and consent races", async () => {
+    const path = join(directory, "single-connection.sqlite")
+    let store = new OAuthStore(path, base)
+    try {
+      const first = store.beginLogin("one")
+      store.activateGrant("one", first, "old-grant")
+      const grant = { accountId: "one" }
+      await new (store.adapter())("Grant").upsert("old-grant", grant, 900)
+      const other = store.beginLogin("two")
+      store.activateGrant("two", other, "other-grant")
+      await new (store.adapter())("Grant").upsert("other-grant", { accountId: "two" }, 900)
+      const latest = store.beginLogin("one")
+      expect(() => store.activateGrant("one", first, "late-grant")).toThrow()
+      store.activateGrant("one", latest, "new-grant")
+      expect(() => store.activateGrant("one", latest, "second-grant")).toThrow()
+      await expect(new (store.adapter())("Grant").upsert("old-grant", grant, 900)).rejects.toThrow()
+      for (const model of ["AuthorizationCode", "AccessToken", "RefreshToken"]) {
+        await expect(new (store.adapter())(model).upsert("late", { accountId: "one", grantId: "old-grant" }, 900)).rejects.toThrow()
+      }
+      store.close()
+      store = new OAuthStore(path, base)
+      expect(store.isCurrentLogin("one", latest)).toBe(true)
+      expect(store.isCurrentLogin("one", first)).toBe(false)
+      expect(await new (store.adapter())("Grant").find("old-grant")).toBeUndefined()
+      expect(await new (store.adapter())("Grant").find("other-grant")).toBeTruthy()
+    } finally { store.close() }
+  })
   it("hashes passwords with different salts and rejects malformed account configuration", async () => {
     const one = await hashPassword(password)
     expect(one).not.toContain(password)
@@ -230,6 +310,7 @@ describe("credentials and persistent OAuth storage", () => {
     const Client = new (store.adapter())("Client")
     await Client.upsert("client", { client_id: "client" })
     const Code = new (store.adapter())("AuthorizationCode")
+    store.activateGrant("employee01", store.beginLogin("employee01"), "grant")
     await Code.upsert("code", { grantId: "grant", accountId: "employee01" }, 120)
     const results = await Promise.allSettled([Code.consume("code"), Code.consume("code")])
     expect(results.filter(r => r.status === "fulfilled")).toHaveLength(1)
