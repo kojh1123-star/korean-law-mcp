@@ -4,6 +4,14 @@ import { dirname, isAbsolute } from "node:path"
 import { createHash, generateKeyPairSync, randomBytes } from "node:crypto"
 import { errors, type AdapterPayload, type AdapterConstructor } from "oidc-provider"
 import type { Employee } from "./oauth-accounts.js"
+import { SERVICE_IDS, type ServiceId } from "./services.js"
+
+export const OPERATIONAL_TABLES = {
+  managed_employees: ["id", "password_hash", "removed"], account_renames: ["old_id", "new_id"],
+  account_controls: ["account_id", "blocked", "last_login", "last_request"],
+  admin_audit: ["id", "at", "actor", "target", "action"], employee_usage: ["day", "account_id", "service", "calls"],
+  service_permissions: ["account_id", "service", "allowed"], service_metrics: ["service", "requests", "errors", "last_success", "last_error"],
+} as const
 
 /** One Railway replica backed by a mounted volume; never an in-memory production adapter. */
 export class OAuthStore {
@@ -44,6 +52,25 @@ export class OAuthStore {
         id TEXT PRIMARY KEY, password_hash TEXT, removed INTEGER NOT NULL DEFAULT 0
       );
       CREATE TABLE IF NOT EXISTS account_renames (old_id TEXT PRIMARY KEY, new_id TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS admin_recovery (account_id TEXT PRIMARY KEY, code_hash TEXT NOT NULL, created INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS service_permissions (account_id TEXT NOT NULL, service TEXT NOT NULL, allowed INTEGER NOT NULL, PRIMARY KEY(account_id,service));
+      CREATE TABLE IF NOT EXISTS service_metrics (service TEXT PRIMARY KEY, requests INTEGER NOT NULL, errors INTEGER NOT NULL, last_success INTEGER, last_error INTEGER);
+    `)
+    if (!this.db.prepare("PRAGMA table_info(active_connections)").all().some(row => row.name === "service")) this.db.exec(`
+      BEGIN IMMEDIATE;
+      ALTER TABLE active_connections RENAME TO old_connections;
+      CREATE TABLE active_connections (account_id TEXT NOT NULL, service TEXT NOT NULL, login_id TEXT NOT NULL, grant_id TEXT, PRIMARY KEY(account_id,service));
+      INSERT INTO active_connections SELECT account_id,'law',login_id,grant_id FROM old_connections;
+      DROP TABLE old_connections;
+      COMMIT;
+    `)
+    if (!this.db.prepare("PRAGMA table_info(employee_usage)").all().some(row => row.name === "service")) this.db.exec(`
+      BEGIN IMMEDIATE;
+      ALTER TABLE employee_usage RENAME TO old_usage;
+      CREATE TABLE employee_usage (day TEXT NOT NULL, account_id TEXT NOT NULL, service TEXT NOT NULL, calls INTEGER NOT NULL, PRIMARY KEY(day,account_id,service));
+      INSERT INTO employee_usage SELECT day,account_id,'law',calls FROM old_usage;
+      DROP TABLE old_usage;
+      COMMIT;
     `)
     const savedIssuer = this.setting("issuer", () => issuer)
     if (savedIssuer !== issuer) { this.close(); throw new Error("OAuth database issuer differs from OAUTH_ISSUER. Use the original issuer or a new volume.") }
@@ -75,9 +102,11 @@ export class OAuthStore {
     throw new Error("Invalid account rename chain.")
   }
   /** Commit credentials, role alias, history migration and revocation as one atomic change. */
-  changeAdminAccount(previous: Employee, next: Employee) {
+  changeAdminAccount(previous: Employee, next: Employee, options: { actor?: string; action?: string; recoveryHash?: string } = {}) {
     this.db.exec("BEGIN IMMEDIATE")
     try {
+      if (options.recoveryHash && this.db.prepare("DELETE FROM admin_recovery WHERE account_id=? AND code_hash=?").run(previous.id, options.recoveryHash).changes !== 1) throw new Error("Invalid recovery code.")
+      this.db.prepare("DELETE FROM admin_recovery WHERE account_id=?").run(previous.id)
       if (previous.id !== next.id && this.wasManaged(next.id)) throw new Error("Account ID already used.")
       this.db.prepare(`INSERT INTO managed_employees(id,password_hash,removed) VALUES(?,?,0)
         ON CONFLICT(id) DO UPDATE SET password_hash=excluded.password_hash, removed=0`).run(next.id, next.passwordHash)
@@ -92,13 +121,56 @@ export class OAuthStore {
         this.db.prepare("INSERT INTO account_renames(old_id,new_id) VALUES(?,?)").run(previous.id, next.id)
         this.db.prepare("UPDATE employee_usage SET account_id=? WHERE account_id=?").run(next.id, previous.id)
         this.db.prepare("UPDATE account_controls SET account_id=? WHERE account_id=?").run(next.id, previous.id)
+        this.db.prepare("UPDATE service_permissions SET account_id=? WHERE account_id=?").run(next.id, previous.id)
         this.db.prepare("INSERT INTO account_controls(account_id,blocked) VALUES(?,1)").run(previous.id)
       }
       const fingerprints = JSON.parse(this.setting("accounts", () => "{}")) as Record<string, string>
       delete fingerprints[previous.id]
       fingerprints[next.id] = createHash("sha256").update(next.passwordHash).digest("hex")
       this.db.prepare("UPDATE settings SET value=? WHERE key='accounts'").run(JSON.stringify(fingerprints))
-      this.db.prepare("INSERT INTO admin_audit(at,actor,target,action) VALUES(?,?,?,'credentials')").run(Math.floor(Date.now() / 1000), previous.id, next.id)
+      this.db.prepare("INSERT INTO admin_audit(at,actor,target,action) VALUES(?,?,?,?)").run(Math.floor(Date.now() / 1000), options.actor || previous.id, next.id, options.action || "credentials")
+      this.db.exec("COMMIT")
+    } catch (error) { this.db.exec("ROLLBACK"); throw error }
+  }
+  issueRecoveryCode(accountId: string): string {
+    const code = randomBytes(32).toString("hex")
+    this.db.prepare(`INSERT INTO admin_recovery VALUES(?,?,?) ON CONFLICT(account_id) DO UPDATE SET code_hash=excluded.code_hash,created=excluded.created`)
+      .run(accountId, createHash("sha256").update(code).digest("hex"), Math.floor(Date.now() / 1000))
+    this.audit(accountId, accountId, "recovery_issue")
+    return code
+  }
+  recoveryMatches(accountId: string, code: string): boolean {
+    return /^[a-f0-9]{64}$/.test(code) && !!this.db.prepare("SELECT 1 FROM admin_recovery WHERE account_id=? AND code_hash=?")
+      .get(accountId, createHash("sha256").update(code).digest("hex"))
+  }
+  recoveryCreated(accountId: string): number | null {
+    const row = this.db.prepare("SELECT created FROM admin_recovery WHERE account_id=?").get(accountId)
+    return row ? Number(row.created) : null
+  }
+  audit(actor: string, target: string, action: string) {
+    this.db.prepare("INSERT INTO admin_audit(at,actor,target,action) VALUES(?,?,?,?)").run(Math.floor(Date.now() / 1000), actor, target, action)
+  }
+  exportOperational() {
+    const tables = Object.fromEntries(Object.entries(OPERATIONAL_TABLES).map(([name, columns]) => [name, this.db.prepare(`SELECT ${columns.join(",")} FROM ${name}`).all()]))
+    return { tables, usageStartedAt: Number(this.setting("usage-started-at", () => String(Math.floor(Date.now() / 1000)))) }
+  }
+  restoreOperational(tables: Record<string, Record<string, string | number | null>[]>, accounts: Map<string, Employee>, bootstrap: Map<string, Employee>, adminRoots: string[], usageStartedAt: number) {
+    this.db.exec("BEGIN IMMEDIATE")
+    try {
+      for (const [name, columns] of Object.entries(OPERATIONAL_TABLES)) {
+        this.db.exec(`DELETE FROM ${name}`)
+        const statement = this.db.prepare(`INSERT INTO ${name}(${columns.join(",")}) VALUES(${columns.map(() => "?").join(",")})`)
+        for (const row of tables[name] || []) statement.run(...columns.map(column => row[column]))
+      }
+      for (const employee of accounts.values()) this.db.prepare(`INSERT INTO managed_employees VALUES(?,?,0)
+        ON CONFLICT(id) DO UPDATE SET password_hash=excluded.password_hash,removed=0`).run(employee.id, employee.passwordHash)
+      for (const id of bootstrap.keys()) if (!accounts.has(id)) this.db.prepare(`INSERT INTO managed_employees VALUES(?,NULL,1)
+        ON CONFLICT(id) DO UPDATE SET password_hash=NULL,removed=1`).run(id)
+      if (!adminRoots.length || adminRoots.some(root => !accounts.has(this.resolveAccountId(root)) || this.isBlocked(this.resolveAccountId(root)))) throw new Error("Backup does not contain an available configured administrator.")
+      this.db.exec("DELETE FROM active_connections; DELETE FROM admin_recovery; DELETE FROM objects WHERE model<>'Client'")
+      const fingerprints = Object.fromEntries([...accounts].map(([id, employee]) => [id, createHash("sha256").update(employee.passwordHash).digest("hex")]))
+      this.db.prepare("UPDATE settings SET value=? WHERE key='accounts'").run(JSON.stringify(fingerprints))
+      this.db.prepare("UPDATE settings SET value=? WHERE key='usage-started-at'").run(String(usageStartedAt))
       this.db.exec("COMMIT")
     } catch (error) { this.db.exec("ROLLBACK"); throw error }
   }
@@ -111,18 +183,18 @@ export class OAuthStore {
     } catch (error) { this.db.exec("ROLLBACK"); throw error }
   }
   /** Accepted tools/call attempts, including eventual errors; never query text or tokens. */
-  recordToolCalls(accountId: string, count: number, now = Date.now()) {
+  recordToolCalls(accountId: string, count: number, now = Date.now(), service: ServiceId = "law") {
     if (!Number.isSafeInteger(count) || count <= 0) return
     accountId = this.resolveAccountId(accountId)
     const day = new Date(now + 9 * 3600000).toISOString().slice(0, 10)
-    this.db.prepare(`INSERT INTO employee_usage VALUES(?,?,?)
-      ON CONFLICT(day,account_id) DO UPDATE SET calls=employee_usage.calls+excluded.calls`).run(day, accountId, count)
+    this.db.prepare(`INSERT INTO employee_usage VALUES(?,?,?,?)
+      ON CONFLICT(day,account_id,service) DO UPDATE SET calls=employee_usage.calls+excluded.calls`).run(day, accountId, service, count)
   }
-  usageSummary(period: "today" | "month" | "all", accountIds: string[], now = Date.now()) {
+  usageSummary(period: "today" | "month" | "all", accountIds: string[], now = Date.now(), service: ServiceId | "all" = "all") {
     const today = new Date(now + 9 * 3600000).toISOString().slice(0, 10)
     const from = period === "today" ? today : period === "month" ? today.slice(0, 7) + "-01" : "0000-01-01"
     const saved = this.db.prepare(`SELECT account_id, SUM(calls) AS calls FROM employee_usage
-      WHERE day>=? AND day<=? GROUP BY account_id`).all(from, today)
+      WHERE day>=? AND day<=? AND (?='all' OR service=?) GROUP BY account_id`).all(from, today, service, service)
     const counts = new Map(saved.map(r => [String(r.account_id), Number(r.calls)]))
     const ids = [...new Set([...accountIds, ...counts.keys()])]
     const total = [...counts.values()].reduce((sum, value) => sum + value, 0)
@@ -131,16 +203,15 @@ export class OAuthStore {
         percent: total ? (counts.get(id) || 0) / total * 100 : 0 })) }
   }
   /** A successful password check replaces the account's connection atomically. */
-  beginLogin(accountId: string, interactionId = ""): string {
+  beginLogin(accountId: string, interactionId = "", service: ServiceId = "law"): string {
     const loginId = randomBytes(32).toString("hex")
     this.db.exec("BEGIN IMMEDIATE")
     try {
-      if (this.isBlocked(accountId)) throw new errors.AccessDenied("Account disabled.")
-      this.db.prepare(`INSERT INTO active_connections VALUES(?,?,NULL)
-        ON CONFLICT(account_id) DO UPDATE SET login_id=excluded.login_id, grant_id=NULL`).run(accountId, loginId)
-      const grants = this.db.prepare("SELECT id FROM objects WHERE model='Grant' AND json_extract(payload,'$.accountId')=?").all(accountId)
-      for (const grant of grants) this.revokeGrant(String(grant.id), interactionId)
-      this.db.prepare("DELETE FROM objects WHERE model IN ('AccessToken','RefreshToken','AuthorizationCode') AND json_extract(payload,'$.accountId')=?").run(accountId)
+      if (!this.canUse(accountId, service)) throw new errors.AccessDenied("Account or service disabled.")
+      const previous = this.db.prepare("SELECT grant_id FROM active_connections WHERE account_id=? AND service=?").get(accountId, service)
+      if (previous?.grant_id) this.revokeGrant(String(previous.grant_id), interactionId)
+      this.db.prepare(`INSERT INTO active_connections VALUES(?,?,?,NULL)
+        ON CONFLICT(account_id,service) DO UPDATE SET login_id=excluded.login_id, grant_id=NULL`).run(accountId, service, loginId)
       this.db.prepare(`INSERT INTO account_controls(account_id,last_login) VALUES(?,?)
         ON CONFLICT(account_id) DO UPDATE SET last_login=excluded.last_login`).run(accountId, Math.floor(Date.now() / 1000))
       this.db.exec("COMMIT")
@@ -154,15 +225,15 @@ export class OAuthStore {
     this.db.prepare(`INSERT INTO account_controls(account_id,last_request) VALUES(?,?)
       ON CONFLICT(account_id) DO UPDATE SET last_request=excluded.last_request`).run(accountId, Math.floor(Date.now() / 1000))
   }
-  connectionSummary(accountId: string) {
+  connectionSummary(accountId: string, service: ServiceId | "all" = "all") {
     const now = Math.floor(Date.now() / 1000)
     const controls = this.db.prepare("SELECT blocked,last_login,last_request FROM account_controls WHERE account_id=?").get(accountId)
     const connected = !this.isBlocked(accountId) && !!this.db.prepare(`SELECT 1 FROM active_connections c
       JOIN objects g ON g.model='Grant' AND g.id=c.grant_id
       JOIN objects t ON t.grant_id=c.grant_id AND t.model IN ('AccessToken','RefreshToken')
-      WHERE c.account_id=? AND g.expires>? AND t.expires>?
+      WHERE c.account_id=? AND (?='all' OR c.service=?) AND g.expires>? AND t.expires>?
       AND (json_extract(t.payload,'$.exp') IS NULL OR json_extract(t.payload,'$.exp')>?)
-      AND json_extract(t.payload,'$.consumed') IS NULL LIMIT 1`).get(accountId, now, now, now)
+      AND json_extract(t.payload,'$.consumed') IS NULL LIMIT 1`).get(accountId, service, service, now, now, now)
     return { id: accountId, blocked: controls?.blocked === 1, connected,
       lastLogin: controls?.last_login == null ? null : Number(controls.last_login),
       lastRequest: controls?.last_request == null ? null : Number(controls.last_request) }
@@ -194,12 +265,12 @@ export class OAuthStore {
   revokeAdminSessions(accountId: string) {
     this.db.prepare("DELETE FROM objects WHERE model='AdminSession' AND json_extract(payload,'$.accountId')=?").run(accountId)
   }
-  isCurrentLogin(accountId: string, loginId: unknown): boolean {
-    return !this.isBlocked(accountId) && typeof loginId === "string" && !!this.db.prepare("SELECT 1 FROM active_connections WHERE account_id=? AND login_id=?").get(accountId, loginId)
+  isCurrentLogin(accountId: string, loginId: unknown, service: ServiceId = "law"): boolean {
+    return this.canUse(accountId, service) && typeof loginId === "string" && !!this.db.prepare("SELECT 1 FROM active_connections WHERE account_id=? AND service=? AND login_id=?").get(accountId, service, loginId)
   }
-  activateGrant(accountId: string, loginId: unknown, grantId: string) {
-    if (this.isBlocked(accountId) || typeof loginId !== "string" || this.db.prepare(`UPDATE active_connections SET grant_id=?
-      WHERE account_id=? AND login_id=? AND (grant_id IS NULL OR grant_id=?)`).run(grantId, accountId, loginId, grantId).changes !== 1) {
+  activateGrant(accountId: string, loginId: unknown, grantId: string, service: ServiceId = "law") {
+    if (!this.canUse(accountId, service) || typeof loginId !== "string" || this.db.prepare(`UPDATE active_connections SET grant_id=?
+      WHERE account_id=? AND service=? AND login_id=? AND (grant_id IS NULL OR grant_id=?)`).run(grantId, accountId, service, loginId, grantId).changes !== 1) {
       throw new errors.InvalidGrant("This login was replaced. Start a new login.")
     }
   }
@@ -208,7 +279,38 @@ export class OAuthStore {
     const grantId = model === "Grant" ? id : payload.grantId
     if (typeof payload.accountId !== "string" || typeof grantId !== "string") return false
     if (this.isBlocked(payload.accountId)) return false
-    return !!this.db.prepare("SELECT 1 FROM active_connections WHERE account_id=? AND grant_id=?").get(payload.accountId, grantId)
+    const connection = this.db.prepare("SELECT service FROM active_connections WHERE account_id=? AND grant_id=?").get(payload.accountId, grantId)
+    return !!connection && this.canUse(payload.accountId, connection.service as ServiceId)
+  }
+  canUse(accountId: string, service: ServiceId): boolean {
+    return !this.isBlocked(accountId) && this.db.prepare("SELECT allowed FROM service_permissions WHERE account_id=? AND service=?").get(accountId, service)?.allowed !== 0
+  }
+  setServices(actor: string, accountId: string, allowed: ServiceId[]) {
+    this.db.exec("BEGIN IMMEDIATE")
+    try {
+      for (const service of SERVICE_IDS) {
+        this.db.prepare(`INSERT INTO service_permissions VALUES(?,?,?) ON CONFLICT(account_id,service) DO UPDATE SET allowed=excluded.allowed`).run(accountId, service, allowed.includes(service) ? 1 : 0)
+        if (!allowed.includes(service)) {
+          const previous = this.db.prepare("SELECT grant_id FROM active_connections WHERE account_id=? AND service=?").get(accountId, service)
+          if (previous?.grant_id) this.revokeGrant(String(previous.grant_id))
+          this.db.prepare("DELETE FROM active_connections WHERE account_id=? AND service=?").run(accountId, service)
+        }
+      }
+      this.audit(actor, accountId, "services")
+      this.db.exec("COMMIT")
+    } catch (error) { this.db.exec("ROLLBACK"); throw error }
+  }
+  serviceResult(service: ServiceId, failed: boolean) {
+    const now = Math.floor(Date.now() / 1000)
+    this.db.prepare(`INSERT INTO service_metrics VALUES(?,1,?,?,?) ON CONFLICT(service) DO UPDATE SET requests=service_metrics.requests+1,
+      errors=service_metrics.errors+excluded.errors,last_success=COALESCE(excluded.last_success,service_metrics.last_success),last_error=COALESCE(excluded.last_error,service_metrics.last_error)`)
+      .run(service, failed ? 1 : 0, failed ? null : now, failed ? now : null)
+  }
+  serviceAllowed(accountId: string, service: ServiceId) {
+    return this.db.prepare("SELECT allowed FROM service_permissions WHERE account_id=? AND service=?").get(accountId, service)?.allowed !== 0
+  }
+  serviceMetrics(service: ServiceId) {
+    return this.db.prepare("SELECT requests,errors,last_success,last_error FROM service_metrics WHERE service=?").get(service) || { requests: 0, errors: 0, last_success: null, last_error: null }
   }
   setting(key: string, create: () => string): string {
     const saved = this.db.prepare("SELECT value FROM settings WHERE key=?").get(key)

@@ -352,7 +352,7 @@ describe("ChatGPT OAuth authentication", () => {
     expect((await request("/admin", { headers: { authorization: `Bearer ${employeeTokens.access_token}` } })).status).toBe(303)
     expect((await adminLogin()).status).toBe(303)
     const { page, csrf } = await adminCsrf()
-    expect(page).toContain("법령 MCP 계정 관리")
+    expect(page).toContain("통합 MCP 계정 관리")
     expect(page).not.toContain(password)
     expect(page).not.toContain("scrypt-v1")
     expect(page).not.toContain(employeeTokens.access_token)
