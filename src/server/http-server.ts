@@ -69,6 +69,11 @@ export async function startHTTPServer(
   // A reverse-proxy deployment opts in with a bounded numeric hop count.
   app.set("trust proxy", config.trustProxy)
 
+  // The OAuth routes own their body parsing and must precede the legacy token gate.
+  const oauth = process.env.OAUTH_ENABLED === "1"
+    ? await (await import("./oauth-server.js")).installOAuth(app, config.trustProxy)
+    : undefined
+
   // ACCESS_LOG=1 일 때만 요청 로그 — req.path만 기록 (쿼리스트링의 oc= API 키 유출 방지)
   if (process.env.ACCESS_LOG === "1") {
     app.use((req, _res, next) => {
@@ -122,19 +127,18 @@ export async function startHTTPServer(
     next()
   })
 
-  // ── 접근 인증 (MCP_AUTH_TOKEN 설정 시에만 활성) ────────────────────────────
-  // 폐쇄망·사내망 배포처럼 서버 자체에 접근 통제가 필요한 환경에서 설정한다.
-  // 미설정이면 기존처럼 공개 동작 (법제처 API 키는 인가 수단이 아니다).
+  // ── 접근 인증: 기존 고정 토큰 또는 직원 OAuth 토큰 ────────────────────────
+  // 법제처 API 키와 MCP 서버 접근 권한은 별도로 처리한다.
   const authToken = config.authToken
-  if (!authToken) {
+  if (!authToken && !oauth) {
     if (config.allowUnauthenticatedRemote) {
       console.error("⚠️  MCP_ALLOW_UNAUTHENTICATED_REMOTE=1 — non-loopback /mcp is intentionally unauthenticated.")
     } else {
       console.error("ℹ️  MCP_AUTH_TOKEN 미설정 — loopback HTTP only. Remote exposure requires MCP_AUTH_TOKEN or an explicit override.")
     }
   }
-  app.use((req, res, next) => {
-    if (!authToken) return next()
+  app.use(async (req, res, next) => {
+    if (!authToken && !oauth) return next()
     if (req.method === "OPTIONS") return next() // 프리플라이트는 인증 헤더를 못 싣는다
     if (req.path === "/health" || req.path === "/") return next()
 
@@ -142,15 +146,21 @@ export async function startHTTPServer(
       (req.headers["x-mcp-token"] as string | undefined) ||
       bearerValue(req.headers["authorization"] as string | undefined)
 
-    if (!presented || !safeEqual(presented, authToken)) {
-      res.status(401).json({
-        jsonrpc: "2.0",
-        error: { code: -32001, message: "Unauthorized." },
-        id: null,
-      })
-      return
+    if (authToken && presented && safeEqual(presented, authToken)) {
+      res.locals.mcpAccessAuthenticated = true
+      return next()
     }
-    next()
+    const oauthResult = oauth ? await oauth.authenticate(req) : "invalid"
+    if (oauthResult === "valid") {
+      res.locals.mcpAccessAuthenticated = true
+      return next()
+    }
+    oauth?.challenge(res, oauthResult === "scope")
+    res.status(oauthResult === "scope" ? 403 : 401).json({
+      jsonrpc: "2.0",
+      error: { code: -32001, message: "Unauthorized." },
+      id: null,
+    })
   })
 
   app.use(express.json({ limit: config.bodyLimitBytes }))
@@ -279,7 +289,7 @@ export async function startHTTPServer(
     // ALLOW_QUERY_API_KEY=0 으로 쿼리 경로를 차단할 수 있다 (폐쇄망 권장).
     // 인증이 켜진 경우 Authorization 헤더는 접근 토큰이므로 법제처 키로 오인하면 안 된다.
     const authHeader = bearerValue(req.headers["authorization"] as string | undefined)
-    const authHeaderIsAccessToken = Boolean(authToken) && authHeader && safeEqual(authHeader, authToken)
+    const authHeaderIsAccessToken = res.locals.mcpAccessAuthenticated === true
     const queryKey = process.env.ALLOW_QUERY_API_KEY === "0" ? undefined : (req.query.oc as string | undefined)
     const apiKey =
       (req.headers["apikey"] as string | undefined) ||
@@ -426,6 +436,14 @@ export async function startHTTPServer(
     })
   }
 
-  process.on("SIGINT", () => gracefulShutdown("SIGINT"))
-  process.on("SIGTERM", () => gracefulShutdown("SIGTERM"))
+  const onSigint = () => gracefulShutdown("SIGINT")
+  const onSigterm = () => gracefulShutdown("SIGTERM")
+  process.on("SIGINT", onSigint)
+  process.on("SIGTERM", onSigterm)
+  expressServer.once("close", () => {
+    oauth?.close()
+    process.off("SIGINT", onSigint)
+    process.off("SIGTERM", onSigterm)
+  })
+  return expressServer
 }

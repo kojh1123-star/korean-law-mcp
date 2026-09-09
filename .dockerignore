@@ -10,3 +10,7 @@ README.md
 .vscode
 .idea
 *.md
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+oauth-data

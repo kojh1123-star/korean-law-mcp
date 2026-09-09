@@ -55,7 +55,10 @@ function verifyExportTargets(value, label = "exports") {
 }
 
 function packedFiles() {
-  const result = spawnSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], {
+  // Invoke npm's JS entry directly on Windows; spawning npm.cmd without a shell fails.
+  const npmCli = process.env.npm_execpath || (process.platform === "win32" ? resolve(dirname(process.execPath), "node_modules/npm/bin/npm-cli.js") : undefined)
+  const args = ["pack", "--dry-run", "--json", "--ignore-scripts"]
+  const result = spawnSync(npmCli ? process.execPath : "npm", npmCli ? [npmCli, ...args] : args, {
     cwd: root,
     encoding: "utf8",
   })

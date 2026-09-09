@@ -76,7 +76,8 @@ export function readHttpServerConfig(env: NodeJS.ProcessEnv = process.env): Http
   const authToken = env.MCP_AUTH_TOKEN ?? ""
   const hasAuthToken = authToken.trim().length > 0
   const allowUnauthenticatedRemote = parseRemoteUnauthenticatedOverride(env.MCP_ALLOW_UNAUTHENTICATED_REMOTE)
-  if (!isLoopbackHost(host) && !hasAuthToken && !allowUnauthenticatedRemote) {
+  if (env.OAUTH_ENABLED !== undefined && !["0", "1"].includes(env.OAUTH_ENABLED)) throw new Error("OAUTH_ENABLED must be 0 or 1.")
+  if (!isLoopbackHost(host) && !hasAuthToken && env.OAUTH_ENABLED !== "1" && !allowUnauthenticatedRemote) {
     throw new Error(
       "MCP_HTTP_HOST is non-loopback. Set MCP_AUTH_TOKEN or explicitly set MCP_ALLOW_UNAUTHENTICATED_REMOTE=1.",
     )
