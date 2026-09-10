@@ -173,3 +173,17 @@ Claude에서 **Customize → Connectors → Add custom connector**를 열어 다
 **기존 중복 로그인 제한은 그대로입니다.** 한 직원이 같은 서비스에 Claude로 새 로그인하면 그 서비스의 기존 ChatGPT 연결이 종료됩니다. 다른 서비스 연결과 다른 직원은 유지됩니다.
 
 공식 근거(2026-09-10 확인, 신뢰도 높음): [Claude 인증 규격](https://claude.com/docs/connectors/building/authentication), [사용자 지정 원격 MCP 연결](https://claude.com/docs/connectors/custom/remote-mcp). 서버 테스트에서 세 서비스의 Claude 콜백 등록·로그인·동의·도구 목록·갱신을 검증합니다. 실제 직원의 Claude 계정에서 연결 완료 여부는 해당 계정에서 확인해야 합니다.
+
+### 연결 시작부터 오류가 나는 경우
+
+주소창의 `client_id`에 직원 아이디가 들어갔다면 앱 연결 설정과 직원 로그인을 혼동한 것입니다. Claude에 저장된 OAuth 설정은 오류 페이지 새로고침으로 바뀌지 않습니다. 연결에 실패한 커넥터를 제거하고 같은 MCP URL로 다시 등록하세요. 정상적인 다른 커넥터는 제거할 필요 없습니다.
+
+| Claude 연결 설정 | 입력값 |
+|---|---|
+| Client ID | 비워두기 (자동 등록) |
+| Client Secret | 비워두기 |
+| OAuth client 선택 화면이 있는 경우 | No client ID — register one automatically |
+
+직원 아이디·비밀번호는 이후 MCP 로그인 페이지에서만 입력합니다. Client ID를 직접 지정하는 방식을 선택했다면 서버에 미리 등록된 공개 Client ID `claude-web`을 사용할 수 있으며, Client Secret은 비워둡니다. 이 값은 세 서비스 공통입니다. 직원 비밀번호나 기관 인증키를 Client Secret에 입력하지 않습니다.
+
+`claude-web`은 공식 Claude 웹 콜백만 허용하며, PKCE와 직원 로그인·동의, 기존 서비스별 연결 제한을 유지합니다. 운영자가 `OAUTH_REDIRECT_URIS`에서 Claude 콜백을 제외하면 이 고정 클라이언트도 비활성화됩니다. 오류 페이지는 입력값이나 직원 계정 존재 여부를 노출하지 않고 `OAUTH_CLIENT_INVALID` 진단 코드와 재등록 방법을 표시합니다.

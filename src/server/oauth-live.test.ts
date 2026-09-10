@@ -143,6 +143,38 @@ const choose = (s: string) => { service = s; resource = base + (s === "law" ? "/
 const rpc = (path: string, token: string, method = "tools/list", params = {}) => request(path, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json", accept: "application/json, text/event-stream" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) })
 
 describe("Claude and live request accounting", () => {
+  it("explains invalid employee-as-client settings without reflecting supplied credentials", async () => {
+    choose("law")
+    for (const id of ["employee01", "unknown-client", '<script>alert("secret")</script>']) {
+      const { response } = await startAuthorization({ client_id: id, client_secret: "do-not-reflect-secret" })
+      expect(response.status).toBe(400)
+      expect(response.headers.get("location")).toBeNull()
+      const body = await response.text()
+      expect(body).toContain("OAUTH_CLIENT_INVALID")
+      expect(body).toContain("직원 아이디는 Client ID가 아닙니다")
+      expect(body).toContain("claude-web")
+      expect(body).not.toContain(id)
+      expect(body).not.toContain("do-not-reflect-secret")
+    }
+  })
+  it("supports the manual Claude public client with PKCE and employee login for all services", async () => {
+    const registered = clientId
+    clientId = "claude-web"
+    try {
+      for (const name of ["law", "g2b", "kosis"]) {
+        choose(name)
+        const token = await exchange()
+        expect((await rpc(new URL(resource).pathname, token.access_token)).status).toBe(200)
+        expect((await tokenRequest({ grant_type: "refresh_token", refresh_token: token.refresh_token, resource })).status).toBe(200)
+      }
+      const badCallback = await startAuthorization({ redirect_uri: "https://claude.ai.attacker.example/api/mcp/auth_callback" })
+      expect(badCallback.response.status).toBe(400)
+      expect(badCallback.response.headers.get("location")).toBeNull()
+      const noPkce = await startAuthorization({ code_challenge: "", code_challenge_method: "" })
+      expect([302, 303]).toContain(noPkce.response.status)
+      expect(noPkce.response.headers.get("location")).toContain("error=")
+    } finally { clientId = registered }
+  }, 20000)
   it("registers Claude and completes OAuth without openid, resource-bound tool listing, and token refresh", async () => {
     for (const name of ["law", "g2b", "kosis"]) {
       choose(name)
