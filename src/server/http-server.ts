@@ -7,6 +7,7 @@
  */
 
 import express from "express"
+import { trafficGroup } from "./traffic.js"
 import { SERVICES, SERVICE_IDS, serviceForPath } from "./services.js"
 import { createG2bServer } from "../integrations/g2b/server.mjs"
 import { createKosisServer } from "../integrations/kosis/server.js"
@@ -71,6 +72,19 @@ export async function startHTTPServer(
   // Direct deployments must not trust a spoofable X-Forwarded-For header.
   // A reverse-proxy deployment opts in with a bounded numeric hop count.
   app.set("trust proxy", config.trustProxy)
+
+  // Observe every completed HTTP response, including discovery and rejected requests.
+  app.use((req, res, next) => {
+    // Mounted routers temporarily shorten req.path while completing their response.
+    const group = trafficGroup(req.path)
+    res.once("finish", () => {
+      const principal = oauth?.principal(req)
+      oauth?.recordTraffic({ group, method: req.method, status: res.statusCode,
+        auth: principal ? "employee" : res.locals.machineAuthenticated ? "machine" : "anonymous",
+        accountId: principal?.accountId, calls: res.locals.admittedToolCalls || 0 })
+    })
+    next()
+  })
 
   // The OAuth routes own their body parsing and must precede the legacy token gate.
   const oauth = process.env.OAUTH_ENABLED === "1"
@@ -150,6 +164,7 @@ export async function startHTTPServer(
       bearerValue(req.headers["authorization"] as string | undefined)
 
     if (authToken && presented && safeEqual(presented, authToken)) {
+      res.locals.machineAuthenticated = true
       res.locals.mcpAccessAuthenticated = true
       return next()
     }
@@ -363,6 +378,7 @@ export async function startHTTPServer(
 
       // Count employee tool-call attempts only after authentication and all admission limits.
       // Handshakes, tool lists, rejected traffic and shared machine tokens have no employee usage.
+      res.locals.admittedToolCalls = fallbackCallCount
       oauth?.recordToolCalls(req, fallbackCallCount)
 
       // ALS로 요청 단위 API 키 격리 (동시 요청 안전)

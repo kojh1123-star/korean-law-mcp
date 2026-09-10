@@ -5,6 +5,7 @@ import { createHash, generateKeyPairSync, randomBytes } from "node:crypto"
 import { errors, type AdapterPayload, type AdapterConstructor } from "oidc-provider"
 import type { Employee } from "./oauth-accounts.js"
 import { SERVICE_IDS, type ServiceId } from "./services.js"
+import type { TrafficEvent } from "./traffic.js"
 
 export const OPERATIONAL_TABLES = {
   managed_employees: ["id", "password_hash", "removed"], account_renames: ["old_id", "new_id"],
@@ -55,6 +56,8 @@ export class OAuthStore {
       CREATE TABLE IF NOT EXISTS admin_recovery (account_id TEXT PRIMARY KEY, code_hash TEXT NOT NULL, created INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS service_permissions (account_id TEXT NOT NULL, service TEXT NOT NULL, allowed INTEGER NOT NULL, PRIMARY KEY(account_id,service));
       CREATE TABLE IF NOT EXISTS service_metrics (service TEXT PRIMARY KEY, requests INTEGER NOT NULL, errors INTEGER NOT NULL, last_success INTEGER, last_error INTEGER);
+      CREATE TABLE IF NOT EXISTS http_traffic(day TEXT, category TEXT, method TEXT, status INTEGER, auth TEXT, requests INTEGER NOT NULL, calls INTEGER NOT NULL, last_at INTEGER NOT NULL, PRIMARY KEY(day,category,method,status,auth));
+      CREATE TABLE IF NOT EXISTS recent_traffic(id INTEGER PRIMARY KEY, at INTEGER NOT NULL, category TEXT, method TEXT, status INTEGER, auth TEXT, account_id TEXT, calls INTEGER NOT NULL);
     `)
     if (!this.db.prepare("PRAGMA table_info(active_connections)").all().some(row => row.name === "service")) this.db.exec(`
       BEGIN IMMEDIATE;
@@ -75,6 +78,7 @@ export class OAuthStore {
     const savedIssuer = this.setting("issuer", () => issuer)
     if (savedIssuer !== issuer) { this.close(); throw new Error("OAuth database issuer differs from OAUTH_ISSUER. Use the original issuer or a new volume.") }
     this.setting("usage-started-at", () => String(Math.floor(Date.now() / 1000)))
+    this.setting("traffic-started-at", () => String(Math.floor(Date.now() / 1000)))
   }
   /** Database additions/removals override bootstrap environment accounts on every restart. */
   loadEmployees(bootstrap: Map<string, Employee>): Map<string, Employee> {
@@ -311,6 +315,29 @@ export class OAuthStore {
   }
   serviceMetrics(service: ServiceId) {
     return this.db.prepare("SELECT requests,errors,last_success,last_error FROM service_metrics WHERE service=?").get(service) || { requests: 0, errors: 0, last_success: null, last_error: null }
+  }
+  recordTraffic(event: TrafficEvent, now = Date.now()) {
+    const day = new Date(now + 9 * 3600000).toISOString().slice(0, 10), at = Math.floor(now / 1000)
+    const method = ["GET", "HEAD", "POST", "DELETE", "OPTIONS"].includes(event.method) ? event.method : "OTHER"
+    const calls = Number.isSafeInteger(event.calls) && event.calls > 0 ? event.calls : 0
+    this.db.prepare(`INSERT INTO http_traffic VALUES(?,?,?,?,?,1,?,?) ON CONFLICT(day,category,method,status,auth) DO UPDATE SET
+      requests=http_traffic.requests+1,calls=http_traffic.calls+excluded.calls,last_at=excluded.last_at`)
+      .run(day, event.group, method, event.status, event.auth, calls, at)
+    if (["law", "g2b", "kosis", "oauth"].includes(event.group)) {
+      this.db.prepare("INSERT INTO recent_traffic(at,category,method,status,auth,account_id,calls) VALUES(?,?,?,?,?,?,?)")
+        .run(at, event.group, method, event.status, event.auth, event.accountId || null, calls)
+      this.db.exec("DELETE FROM recent_traffic WHERE id NOT IN (SELECT id FROM recent_traffic ORDER BY id DESC LIMIT 100)")
+    }
+  }
+  trafficSummary(period: "today" | "month" | "all", now = Date.now()) {
+    const day = new Date(now + 9 * 3600000).toISOString().slice(0, 10)
+    const since = period === "today" ? day : period === "month" ? day.slice(0, 7) + "-01" : "0000"
+    const rows = this.db.prepare(`SELECT category,auth,SUM(requests) AS requests,SUM(calls) AS calls,
+      SUM(CASE WHEN status>=400 THEN requests ELSE 0 END) AS errors,
+      SUM(CASE WHEN status IN (401,403) THEN requests ELSE 0 END) AS denied, MAX(last_at) AS last_at
+      FROM http_traffic WHERE day>=? GROUP BY category,auth`).all(since)
+    return { startedAt: Number(this.setting("traffic-started-at", () => String(Math.floor(now / 1000)))), rows,
+      recent: this.db.prepare("SELECT at,category,method,status,auth,account_id,calls FROM recent_traffic ORDER BY id DESC LIMIT 30").all() }
   }
   setting(key: string, create: () => string): string {
     const saved = this.db.prepare("SELECT value FROM settings WHERE key=?").get(key)

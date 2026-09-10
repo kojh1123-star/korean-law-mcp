@@ -145,3 +145,31 @@ https://korean-law-mcp-production-e84f.up.railway.app/mcp
 ### 기존 DB 업그레이드
 
 기존 법령 연결과 사용량을 `law` 서비스로 이전합니다. 같은 볼륨을 유지하고 복제본은 1개로 운영하세요. 새 스키마 적용 후 이전 단일 서비스 코드로 즉시 되돌리면 호환되지 않으므로, 롤백은 볼륨 사본과 함께 검토해야 합니다.
+
+## 8. 자동 갱신과 실제 요청 확인 (2026-09-10)
+
+관리자 화면은 보이는 동안 5초마다 서버에서 새 자료를 받아 갱신합니다. 상단의 마지막 수신 시각과 자동 갱신 켜기/끄기를 확인하세요. 직원 등록 입력은 유지되며, 로그인 만료나 통신 실패 시 마지막 자료임을 명시합니다. 배포 직후 기존에 열어둔 화면은 한 번 새로고침해야 새 기능이 적용됩니다.
+
+- **직원별 사용량**은 개인 OAuth 인증과 사용 제한을 통과한 도구 호출입니다. 선택 기간·서비스의 직원 전체 호출 대비 비율이며, 직원 이름을 모르는 공용 토큰 호출은 배분하지 않습니다.
+- **서버에 도착한 요청**은 법령·나라장터·KOSIS, 로그인/연결 준비, 관리자 화면, 상태 확인, 다운로드를 구분한 전체 HTTP 응답 집계입니다. 401/403과 4xx/5xx, 직원/공용 토큰 도구 호출을 따로 표시합니다. OAuth 연결 시작 시 401은 정상적으로 발생할 수 있습니다.
+- **최근 MCP·로그인 요청**은 응답 시각·종류·방식·상태 코드·인증된 직원 계정만 보여줍니다. 최신 100건을 보관하고 30건을 표시하며, 질의 내용·키·IP는 저장하지 않습니다.
+- **연결 주소와 기존 처리 집계**는 기존에 기록하던 인증 이후 MCP POST 통계입니다. 전체 HTTP와 범위가 다릅니다. Railway CPU·메모리 비용은 서버 자원 지표이므로 직원 조회 횟수로 환산하지 않습니다.
+- 새 HTTP 집계는 화면에 표시한 시작 시각 이후부터 기록하며 과거 기록은 소급하지 않습니다. SQLite 볼륨에 보존되지만 운영 JSON 백업/복원 대상에는 포함하지 않습니다. 기존 직원별 사용량은 계속 백업/복원됩니다.
+
+## 9. Claude 웹 연결 (2026-09-10)
+
+Claude에서 **Customize → Connectors → Add custom connector**를 열어 다음 주소를 서비스별로 등록합니다. 화면 명칭은 계정/언어에 따라 다를 수 있습니다.
+
+| 이름 | Remote MCP URL |
+|---|---|
+| 법령 | `https://korean-law-mcp-production-e84f.up.railway.app/mcp` |
+| 나라장터 | `https://korean-law-mcp-production-e84f.up.railway.app/g2b/mcp` |
+| KOSIS | `https://korean-law-mcp-production-e84f.up.railway.app/kosis/mcp` |
+
+인증 선택 화면이 나오면 **Always required**, OAuth client는 **No client ID — register one automatically**를 선택합니다. 이는 동적 클라이언트 등록(DCR) 방식입니다. 별도 Client ID/Secret이나 개인 PC 환경변수는 필요 없습니다. 직원 아이디·비밀번호로 로그인하고 서비스 조회 권한에 동의한 다음 대화의 + 메뉴에서 커넥터를 켭니다. 조직 계정에서는 소유자의 커넥터 추가 권한이 필요할 수 있습니다.
+
+기본 콜백 허용 목록에 `https://claude.ai/api/mcp/auth_callback`을 추가했습니다. `OAUTH_REDIRECT_URIS`를 직접 지정한 서버는 이 주소와 기존 ChatGPT 콜백을 함께 지정해야 합니다. 유사 도메인은 허용하지 않습니다. PKCE S256, 서비스별 리소스/권한 확인, 갱신 토큰 교체를 유지합니다. CIMD와 Claude Code 로컬 콜백은 이 변경의 지원 범위가 아닙니다.
+
+**기존 중복 로그인 제한은 그대로입니다.** 한 직원이 같은 서비스에 Claude로 새 로그인하면 그 서비스의 기존 ChatGPT 연결이 종료됩니다. 다른 서비스 연결과 다른 직원은 유지됩니다.
+
+공식 근거(2026-09-10 확인, 신뢰도 높음): [Claude 인증 규격](https://claude.com/docs/connectors/building/authentication), [사용자 지정 원격 MCP 연결](https://claude.com/docs/connectors/custom/remote-mcp). 서버 테스트에서 세 서비스의 Claude 콜백 등록·로그인·동의·도구 목록·갱신을 검증합니다. 실제 직원의 Claude 계정에서 연결 완료 여부는 해당 계정에서 확인해야 합니다.
