@@ -6,12 +6,14 @@ import { hashPassword, readEmployees, verifyPassword } from "./oauth-accounts.js
 import { installAdmin } from "./oauth-admin.js"
 import { installEmployeeDownloads } from "./employee-downloads.js"
 import { AccountBackups } from "./oauth-backups.js"
+import type { TrafficEvent } from "./traffic.js"
 import { SERVICES, SERVICE_IDS, serviceForPath, type ServiceId } from "./services.js"
 
 export const LAW_SCOPE = "law:read"
 const DISCOVERY_PATHS = new Set(["/.well-known/openid-configuration", "/.well-known/oauth-authorization-server"])
 const METADATA_PATHS = ["/.well-known/oauth-protected-resource", ...SERVICE_IDS.map(id => "/.well-known/oauth-protected-resource" + SERVICES[id].path)]
 const CHATGPT_CALLBACK = "https://chatgpt.com/connector_platform_oauth_redirect"
+const CLAUDE_CALLBACK = "https://claude.ai/api/mcp/auth_callback"
 const escape = (value: unknown) => String(value).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!))
 
 function html(content: string) {
@@ -31,7 +33,7 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
   if (!local && env.OAUTH_DB_PATH === ":memory:") throw new Error("Production OAuth requires persistent storage.")
   const bootstrapEmployees = readEmployees(env.OAUTH_USERS_JSON)
   const configuredAdminIds = (env.OAUTH_ADMIN_IDS || "").split(",").map(id => id.trim()).filter(Boolean)
-  const redirects = (env.OAUTH_REDIRECT_URIS || CHATGPT_CALLBACK).split(",").map(x => x.trim())
+  const redirects = (env.OAUTH_REDIRECT_URIS || [CHATGPT_CALLBACK, CLAUDE_CALLBACK].join(",")).split(",").map(x => x.trim())
   if (!redirects.length || redirects.some(uri => {
     try { const u = new URL(uri); return u.protocol !== "https:" || !!u.hash || !!u.username || !!u.password } catch { return true }
   })) throw new Error("OAUTH_REDIRECT_URIS must contain exact HTTPS callback URLs.")
@@ -100,7 +102,7 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
         || metadata.grant_types?.some(g => !["authorization_code", "refresh_token"].includes(g))
         || metadata.response_types?.some(r => r !== "code")) throw new errors.InvalidClientMetadata("Client metadata is outside the configured policy.")
     } },
-    renderError: async ctx => { ctx.type = "html"; ctx.body = html("<h1>연결을 완료하지 못했습니다</h1><p>ChatGPT에서 연결을 다시 시작해주세요.</p>") },
+    renderError: async ctx => { ctx.type = "html"; ctx.body = html("<h1>연결을 완료하지 못했습니다</h1><p>사용 중인 ChatGPT 또는 Claude에서 연결을 다시 시작해주세요.</p>") },
   }
   const provider = new Provider(issuer, configuration)
   provider.proxy = trustProxy !== false
@@ -147,7 +149,7 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
       res.send(html(`<h1>${serviceName} MCP 로그인</h1><p>관리자가 발급한 직원 계정으로 로그인해주세요.</p><p><small>같은 서비스의 기존 연결은 새 로그인이 성공하면 종료됩니다. 다른 서비스 연결은 유지됩니다.</small></p><form method="post" action="/oauth/interaction/${escape(details.uid)}">${fields}<label for="username">아이디</label><input id="username" name="username" autocomplete="username" maxlength="64" required><label for="password">비밀번호</label><input id="password" name="password" type="password" autocomplete="current-password" maxlength="256" required><button name="action" value="login">로그인</button></form>`))
     } else if (details.prompt.name === "consent" && details.session && employees.has(details.session.accountId)) {
       const client = await provider.Client.find(String(details.params.client_id))
-      res.send(html(`<h1>${serviceName} 조회 연결 허용</h1><p><strong>${escape(client?.clientName || "MCP 클라이언트")}</strong>가 <strong>${escape(details.session.accountId)}</strong> 계정으로 ${serviceName} 조회 도구를 사용하도록 허용합니다.</p><p><small>서버의 API 인증키와 직원 비밀번호는 ChatGPT에 전달되지 않습니다.</small></p><form method="post" action="/oauth/interaction/${escape(details.uid)}">${fields}<button name="action" value="consent">허용</button><button name="action" value="deny">취소</button></form>`))
+      res.send(html(`<h1>${serviceName} 조회 연결 허용</h1><p><strong>${escape(client?.clientName || "MCP 클라이언트")}</strong>(돌아갈 사이트: ${escape(new URL(String(details.params.redirect_uri)).hostname)})가 <strong>${escape(details.session.accountId)}</strong> 계정으로 ${serviceName} 조회 도구를 사용하도록 허용합니다.</p><p><small>서버의 API 인증키와 직원 비밀번호는 ChatGPT에 전달되지 않습니다.</small></p><form method="post" action="/oauth/interaction/${escape(details.uid)}">${fields}<button name="action" value="consent">허용</button><button name="action" value="deny">취소</button></form>`))
     } else { res.status(400).send(html("<h1>연결을 다시 시작해주세요</h1>")) }
   })
   app.post("/oauth/interaction/:uid", formParser, async (req, res) => {
@@ -170,7 +172,7 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
     }
     if (details.prompt.name === "consent" && req.body.action === "consent" && details.session && employees.has(details.session.accountId)) {
       const connectionId = details.lastSubmission?.login?.connectionId
-      if (!store.isCurrentLogin(details.session.accountId, connectionId, service)) return res.status(409).send(html("<h1>다른 곳에서 새로 로그인했거나 권한이 변경되었습니다</h1><p>이 연결은 종료되었습니다. ChatGPT에서 다시 연결해주세요.</p>"))
+      if (!store.isCurrentLogin(details.session.accountId, connectionId, service)) return res.status(409).send(html("<h1>다른 곳에서 새로 로그인했거나 권한이 변경되었습니다</h1><p>이 연결은 종료되었습니다. 사용 중인 ChatGPT 또는 Claude에서 다시 연결해주세요.</p>"))
       const grant = details.grantId ? await provider.Grant.find(details.grantId) : new provider.Grant({ accountId: details.session.accountId, clientId: String(details.params.client_id) })
       if (!grant) return res.status(400).send("Invalid grant.")
       const prompt = details.prompt.details
@@ -207,6 +209,7 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
   const authenticatedAccounts = new WeakMap<Request, { accountId: string; service: ServiceId }>()
   return {
     provider, resource,
+    recordTraffic(event: TrafficEvent) { store.recordTraffic(event) },
     saveDownload: downloads.save,
     principal(req: Request) { return authenticatedAccounts.get(req) },
     serviceResult(service: ServiceId, failed: boolean) { store.serviceResult(service, failed) },
