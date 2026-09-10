@@ -61,7 +61,9 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
   const configuration: Configuration = {
     adapter: store.adapter(),
     clients: [{ client_id: "chatgpt-law", client_name: "ChatGPT 법령 조회", redirect_uris: redirects,
-      response_types: ["code"], grant_types: ["authorization_code", "refresh_token"], token_endpoint_auth_method: "none" }],
+      response_types: ["code"], grant_types: ["authorization_code", "refresh_token"], token_endpoint_auth_method: "none" },
+      ...(redirects.includes(CLAUDE_CALLBACK) ? [{ client_id: "claude-web", client_name: "Claude 웹 조회", redirect_uris: [CLAUDE_CALLBACK],
+        response_types: ["code"] as const, grant_types: ["authorization_code", "refresh_token"] as const, token_endpoint_auth_method: "none" as const }] : [])],
     jwks: keys.jwks,
     cookies: { keys: [keys.cookie], short: { sameSite: "lax", secure: !local, httpOnly: true }, long: { sameSite: "lax", secure: !local, httpOnly: true } },
     pkce: { required: () => true },
@@ -102,7 +104,17 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
         || metadata.grant_types?.some(g => !["authorization_code", "refresh_token"].includes(g))
         || metadata.response_types?.some(r => r !== "code")) throw new errors.InvalidClientMetadata("Client metadata is outside the configured policy.")
     } },
-    renderError: async ctx => { ctx.type = "html"; ctx.body = html("<h1>연결을 완료하지 못했습니다</h1><p>사용 중인 ChatGPT 또는 Claude에서 연결을 다시 시작해주세요.</p>") },
+    renderError: async (ctx, out) => {
+      ctx.type = "html"
+      // Never echo request parameters, employee IDs, secrets, or provider error descriptions.
+      const invalidClient = out.error === "invalid_client"
+      ctx.body = html(invalidClient
+        ? `<h1>앱 연결 설정을 확인해주세요</h1><p>OAuth Client ID를 확인하지 못했습니다. <strong>직원 아이디는 Client ID가 아닙니다.</strong> 직원 아이디·비밀번호는 연결 설정 후 나타나는 MCP 로그인 화면에 입력합니다.</p>
+          <h2>Claude에서 다시 연결하기</h2><ol><li>Claude의 Connectors에서 연결에 실패한 커넥터를 제거하고 다시 추가합니다. 다른 정상 연결은 유지하세요.</li><li>기존 Remote MCP URL을 입력합니다.</li><li>Client ID와 Client Secret 칸을 모두 비웁니다. OAuth client 선택 화면이 있으면 <strong>No client ID — register one automatically</strong>를 선택합니다.</li><li>연결 후 MCP 로그인 화면에서 직원 아이디·비밀번호를 입력합니다.</li></ol>
+          ${redirects.includes(CLAUDE_CALLBACK) ? '<p>Client ID를 직접 지정하려면 <code>claude-web</code>을 입력하고 Client Secret은 비워두세요. 직원 비밀번호를 Client Secret에 넣지 마세요.</p>' : ''}
+          <p>이 오류 페이지를 새로고침해도 Claude에 저장된 설정은 바뀌지 않습니다.</p><p><a href="https://claude.com/docs/connectors/custom/remote-mcp" rel="noreferrer">Claude 공식 연결 안내</a></p><small>진단 코드: OAUTH_CLIENT_INVALID</small>`
+        : `<h1>연결을 완료하지 못했습니다</h1><p>사용 중인 ChatGPT 또는 Claude에서 연결을 다시 시작해주세요. 이전 로그인 링크는 만료되거나 이미 사용되었을 수 있습니다.</p><p>Claude의 Client ID·Client Secret에는 직원 아이디·비밀번호를 넣지 마세요. 두 칸을 비우고 자동 등록을 선택한 뒤, MCP 로그인 화면에서 직원 계정으로 로그인하세요.</p>`)
+    },
   }
   const provider = new Provider(issuer, configuration)
   provider.proxy = trustProxy !== false
