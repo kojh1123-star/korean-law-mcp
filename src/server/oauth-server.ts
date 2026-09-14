@@ -37,6 +37,11 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
   if (!redirects.length || redirects.some(uri => {
     try { const u = new URL(uri); return u.protocol !== "https:" || !!u.hash || !!u.username || !!u.password } catch { return true }
   })) throw new Error("OAUTH_REDIRECT_URIS must contain exact HTTPS callback URLs.")
+  // Chromium checks form-action across the POST -> resume -> client callback
+  // redirect chain. 'self' alone strands users after successful consent.
+  // Only configured callback origins are allowed; the provider still enforces
+  // each client's exact registered redirect URI before issuing a code.
+  const formAction = ["'self'", ...new Set(redirects.map(uri => new URL(uri).origin))].join(" ")
   const resource = `${issuer}/mcp`
   const serviceResource = (id: ServiceId) => issuer + SERVICES[id].path
   const requestedService = (value: unknown): ServiceId => {
@@ -137,7 +142,7 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
     res.setHeader("Referrer-Policy", "same-origin")
     res.setHeader("X-Content-Type-Options", "nosniff")
     res.setHeader("X-Frame-Options", "DENY")
-    res.setHeader("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+    res.setHeader("Content-Security-Policy", `default-src 'none'; style-src 'unsafe-inline'; form-action ${formAction}; frame-ancestors 'none'; base-uri 'none'`)
     if (!local && (req.get("host") !== url.host || req.protocol !== "https")) return res.status(400).send("Invalid OAuth origin.")
     const ip = req.ip || req.socket.remoteAddress || "unknown"
     const bucket = createHash("sha256").update(ip).digest("hex")
