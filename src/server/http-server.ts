@@ -7,7 +7,7 @@
  */
 
 import express from "express"
-import { trafficGroup } from "./traffic.js"
+import { trafficGroup, trafficStage } from "./traffic.js"
 import { SERVICES, SERVICE_IDS, serviceForPath } from "./services.js"
 import { createG2bServer } from "../integrations/g2b/server.mjs"
 import { createKosisServer } from "../integrations/kosis/server.js"
@@ -76,12 +76,14 @@ export async function startHTTPServer(
   // Observe every completed HTTP response, including discovery and rejected requests.
   app.use((req, res, next) => {
     // Mounted routers temporarily shorten req.path while completing their response.
-    const group = trafficGroup(req.path)
+    const originalPath = req.path
+    const group = trafficGroup(originalPath)
     res.once("finish", () => {
       const principal = oauth?.principal(req)
       oauth?.recordTraffic({ group, method: req.method, status: res.statusCode,
         auth: principal ? "employee" : res.locals.machineAuthenticated ? "machine" : "anonymous",
-        accountId: principal?.accountId, calls: res.locals.admittedToolCalls || 0 })
+        accountId: principal?.accountId, calls: res.locals.admittedToolCalls || 0,
+        stage: trafficStage(originalPath, req.body, res.statusCode) })
     })
     next()
   })
