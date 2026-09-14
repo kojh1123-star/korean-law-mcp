@@ -1,4 +1,5 @@
 import type { OAuthStore } from "./oauth-store.js"
+import { TRAFFIC_STAGE_LABELS, type TrafficStage } from "./traffic.js"
 
 const names: Record<string, string> = { law: "법령 MCP", g2b: "나라장터 MCP", kosis: "KOSIS MCP", oauth: "로그인·연결 준비", admin: "관리 화면·자동 갱신", health: "서버 상태 확인", downloads: "엑셀 다운로드", other: "기타 요청" }
 const esc = (s: unknown) => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]!))
@@ -18,5 +19,6 @@ export function trafficHtml(store: OAuthStore, period: "today" | "month" | "all"
     }).join("")}</tbody></table></div>
     <p><small>401은 OAuth 연결을 시작할 때도 정상적으로 발생합니다. 공용 토큰에는 직원 신원이 없으므로 직원 비율에 임의로 배분하지 않습니다. 직원별 집계에는 개인 OAuth 로그인이 필요합니다.</small></p>
     <h2>최근 MCP·로그인 요청</h2><p><small>최근 30건 · 최대 100건 보관 · 요청 내용·인증키·IP는 저장하지 않습니다. 계정은 인증에 성공한 요청만 표시합니다.</small></p>
-    <div class="scroll"><table aria-label="최근 MCP 요청"><thead><tr><th>시각</th><th>종류</th><th>방식</th><th>응답 코드</th><th>확인된 계정</th><th>도구 호출</th></tr></thead><tbody>${snapshot.recent.map(r => `<tr><td>${stamp(r.at)}</td><td>${names[String(r.category)] || "기타"}</td><td>${esc(r.method)}</td><td>${Number(r.status)}</td><td>${r.auth === "employee" ? esc(r.account_id) : r.auth === "machine" ? "공용 토큰" : "직원 인증 전"}</td><td>${Number(r.calls)}회</td></tr>`).join("") || '<tr><td colspan="6">아직 요청이 없습니다.</td></tr>'}</tbody></table></div>`
+    <p><small>도구 목록 수신까지 진행됐는지 실제 요청 단계로 확인하세요. ‘도구 목록’ 요청과 HTTP 응답 코드를 함께 확인하고, ChatGPT·Claude 내부 설치 완료 여부는 해당 앱에서 확인해주세요. 단계 표시 이전 요청은 ‘이전 기록’으로 표시합니다.</small></p>
+    <div class="scroll"><table aria-label="최근 MCP 요청"><thead><tr><th>시각</th><th>종류</th><th>요청 단계</th><th>방식</th><th>응답 코드</th><th>확인된 계정</th><th>도구 호출</th></tr></thead><tbody>${snapshot.recent.map(r => `<tr><td>${stamp(r.at)}</td><td>${names[String(r.category)] || "기타"}</td><td>${esc(TRAFFIC_STAGE_LABELS[String(r.stage) as TrafficStage] || TRAFFIC_STAGE_LABELS.legacy)}</td><td>${esc(r.method)}</td><td>${Number(r.status)}</td><td>${r.auth === "employee" ? esc(r.account_id) : r.auth === "machine" ? "공용 토큰" : "직원 인증 전"}</td><td>${Number(r.calls)}회</td></tr>`).join("") || '<tr><td colspan="7">아직 요청이 없습니다.</td></tr>'}</tbody></table></div>`
 }

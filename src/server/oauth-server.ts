@@ -80,6 +80,7 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
     features: {
       devInteractions: { enabled: false },
       registration: { enabled: true },
+      pushedAuthorizationRequests: { enabled: true },
       revocation: { enabled: true },
       userinfo: { enabled: false },
       rpInitiatedLogout: { enabled: false },
@@ -94,9 +95,21 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
       },
     },
     routes: { authorization: "/oauth/authorize", token: "/oauth/token", jwks: "/oauth/jwks",
-      registration: "/oauth/register", revocation: "/oauth/revoke" },
+      registration: "/oauth/register", revocation: "/oauth/revoke", pushed_authorization_request: "/oauth/request" },
     interactions: { policy, url: (_ctx, interaction) => `/oauth/interaction/${interaction.uid}` },
+    // A browser session remembers one grant per client, not per MCP service.
+    // Reuse only the grant approved in this interaction; each new connection
+    // must start with an empty grant so its complete requested scope is consented.
+    loadExistingGrant: async (ctx) => {
+      const grantId = ctx.oidc.result?.consent?.grantId
+      return grantId ? ctx.oidc.provider.Grant.find(grantId) : undefined
+    },
     findAccount: async (_ctx, id) => employees.has(id) && !store.isBlocked(id) ? { accountId: id, claims: async () => ({ sub: id }) } : undefined,
+    // MCP connections outlive the browser login. The per-service active grant,
+    // account controls and token TTLs enforce their lifetime on every request.
+    // Session binding instead compares the client's one most recent grant and
+    // would invalidate other services when the same client connects again.
+    expiresWithSession: () => false,
     issueRefreshToken: (_ctx, client) => client.grantTypeAllowed("refresh_token"),
     rotateRefreshToken: true,
     ttl: { AccessToken: 900, AuthorizationCode: 120, Interaction: 600, Session: 28800, Grant: 604800,
@@ -142,7 +155,9 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
     res.setHeader("Referrer-Policy", "same-origin")
     res.setHeader("X-Content-Type-Options", "nosniff")
     res.setHeader("X-Frame-Options", "DENY")
-    res.setHeader("Content-Security-Policy", `default-src 'none'; style-src 'unsafe-inline'; form-action ${formAction}; frame-ancestors 'none'; base-uri 'none'`)
+    // oidc-provider adds the exact SHA-256 hash of its form_post auto-submit
+    // script only when a script-src directive exists. Other scripts stay blocked.
+    res.setHeader("Content-Security-Policy", `default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; form-action ${formAction}; frame-ancestors 'none'; base-uri 'none'`)
     if (!local && (req.get("host") !== url.host || req.protocol !== "https")) return res.status(400).send("Invalid OAuth origin.")
     const ip = req.ip || req.socket.remoteAddress || "unknown"
     const bucket = createHash("sha256").update(ip).digest("hex")
