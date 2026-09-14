@@ -95,7 +95,10 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
       },
     },
     routes: { authorization: "/oauth/authorize", token: "/oauth/token", jwks: "/oauth/jwks",
-      registration: "/oauth/register", revocation: "/oauth/revoke", pushed_authorization_request: "/oauth/request" },
+      registration: "/oauth/register", revocation: "/oauth/revoke", pushed_authorization_request: "/oauth/request",
+      // Account switching uses the provider's internal confirmation route even
+      // with public RP-initiated logout disabled. Keep it inside OAuth routing.
+      end_session: "/oauth/session/end" },
     interactions: { policy, url: (_ctx, interaction) => `/oauth/interaction/${interaction.uid}` },
     // A browser session remembers one grant per client, not per MCP service.
     // Reuse only the grant approved in this interaction; each new connection
@@ -159,6 +162,11 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
     // script only when a script-src directive exists. Other scripts stay blocked.
     res.setHeader("Content-Security-Policy", `default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; form-action ${formAction}; frame-ancestors 'none'; base-uri 'none'`)
     if (!local && (req.get("host") !== url.host || req.protocol !== "https")) return res.status(400).send("Invalid OAuth origin.")
+    // This browser-only POST also retains oidc-provider's session-bound XSRF
+    // check; OAuth protocol endpoints continue accepting server-to-server calls.
+    if (req.path === "/oauth/session/end/confirm" && req.method === "POST" && req.get("origin") !== issuer) {
+      return res.status(403).send("Invalid interaction origin.")
+    }
     const ip = req.ip || req.socket.remoteAddress || "unknown"
     const bucket = createHash("sha256").update(ip).digest("hex")
     if (!store.hit(`requests:${bucket}`, 180, 60)) { res.setHeader("Retry-After", "60"); return res.status(429).send("잠시 후 다시 시도해주세요.") }
