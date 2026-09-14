@@ -164,7 +164,7 @@ export async function installOAuth(app: Express, trustProxy: number | false, env
     if (!local && (req.get("host") !== url.host || req.protocol !== "https")) return res.status(400).send("Invalid OAuth origin.")
     // This browser-only POST also retains oidc-provider's session-bound XSRF
     // check; OAuth protocol endpoints continue accepting server-to-server calls.
-    if (req.path === "/oauth/session/end/confirm" && req.method === "POST" && req.get("origin") !== issuer) {
+    if (/^\/oauth\/session\/end\/confirm\/?$/i.test(req.path) && req.method === "POST" && req.get("origin") !== issuer) {
       return res.status(403).send("Invalid interaction origin.")
     }
     const ip = req.ip || req.socket.remoteAddress || "unknown"

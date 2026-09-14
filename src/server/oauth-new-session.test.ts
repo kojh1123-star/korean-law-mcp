@@ -184,6 +184,8 @@ describe("switching employee accounts in one browser", () => {
   it("requires the exact origin, the browser session and its CSRF nonce", async () => {
     const prepared = await prepareAccountSwitch(true)
     expect((await confirm(prepared.action, prepared.xsrf, "https://untrusted.invalid")).status).toBe(403)
+    expect((await confirm(`${prepared.action}/`, prepared.xsrf, "https://untrusted.invalid")).status).toBe(403)
+    expect((await confirm(prepared.action.replace("/end/", "/END/"), prepared.xsrf, "https://untrusted.invalid")).status).toBe(403)
     expect((await confirm(prepared.action, prepared.xsrf, "null")).status).toBe(403)
     const withoutOrigin = await request(prepared.action, form({ xsrf: prepared.xsrf, logout: "yes" }), true)
     expect(withoutOrigin.status).toBe(403)
