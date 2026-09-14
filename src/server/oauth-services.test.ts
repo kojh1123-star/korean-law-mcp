@@ -48,14 +48,16 @@ async function startAuthorization(overrides: Record<string, string> = {}, keepCo
   const response = await request(`/oauth/authorize?${params}`, {}, true)
   return { verifier, response }
 }
-async function login(username = "employee01", keepCookies = false) {
-  const { verifier, response } = await startAuthorization({}, keepCookies)
+async function login(username = "employee01", keepCookies = false, overrides: Record<string, string> = {}) {
+  const { verifier, response } = await startAuthorization(overrides, keepCookies)
   expect(response.status).toBe(303)
   let next = response.headers.get("location")!
   let page = await request(next, {}, true)
   expect(page.headers.get("referrer-policy")).toBe("same-origin")
   let body = await page.text()
   expect(body).toContain("MCP 로그인")
+  const formPolicy = page.headers.get("content-security-policy")!.split(";").find(rule => rule.trim().startsWith("form-action "))!.trim()
+  expect(formPolicy).toBe("form-action 'self' https://chatgpt.com https://claude.ai")
   const csrf = body.match(/name="csrf" value="([^"]+)"/)![1]
   let submitted = await request(next, form({ csrf, username, password, action: "login" }), true)
   expect(submitted.status).toBe(303)
@@ -67,15 +69,17 @@ async function login(username = "employee01", keepCookies = false) {
   expect(page.headers.get("referrer-policy")).toBe("same-origin")
   body = await page.text()
   expect(body).toContain("조회 연결 허용")
+  expect(page.headers.get("content-security-policy")).toContain(formPolicy)
   const consentCsrf = body.match(/name="csrf" value="([^"]+)"/)![1]
   return { next, consentCsrf, verifier }
 }
-async function authorize(username = "employee01", keepCookies = false) {
-  const { next, consentCsrf, verifier } = await login(username, keepCookies)
+async function authorize(username = "employee01", keepCookies = false, overrides: Record<string, string> = {}) {
+  const { next, consentCsrf, verifier } = await login(username, keepCookies, overrides)
   const submitted = await request(next, form({ csrf: consentCsrf, action: "consent" }), true)
   expect(submitted.status).toBe(303)
   const resume = await request(submitted.headers.get("location")!, {}, true)
   expect(resume.status).toBe(303)
+  expect(resume.headers.get("content-security-policy")).toContain("form-action 'self' https://chatgpt.com https://claude.ai;")
   const location = new URL(resume.headers.get("location")!)
   expect(location.origin + location.pathname).toBe(callback)
   expect(location.searchParams.get("iss")).toBe(base)
@@ -142,6 +146,25 @@ afterAll(async () => {
 const choose = (s: string) => { service = s; resource = base + (s === "law" ? "/mcp" : `/${s}/mcp`) }
 const rpc = (path: string, token: string, method = "tools/list", params = {}) => request(path, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json", accept: "application/json, text/event-stream" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) })
 describe("shared accounts across three services", () => {
+  it.each(["law", "g2b", "kosis"])("exchanges OAuth-only %s scope without openid or offline_access", async (selected) => {
+    choose(selected)
+    const { code, verifier } = await authorize("employee01", false, { scope: `${selected}:read` })
+    const response = await tokenRequest({ grant_type: "authorization_code", code, code_verifier: verifier, redirect_uri: callback, resource })
+    expect(response.status, await response.clone().text()).toBe(200)
+    const tokens = await response.json()
+    expect((await rpc(new URL(resource).pathname, tokens.access_token)).status).toBe(200)
+  })
+  it.each(["law", "g2b", "kosis"])("exchanges and refreshes %s when resource is omitted at the token endpoint", async (selected) => {
+    choose(selected)
+    const { code, verifier } = await authorize()
+    const response = await tokenRequest({ grant_type: "authorization_code", code, code_verifier: verifier, redirect_uri: callback })
+    const body = await response.text()
+    expect(response.status, body).toBe(200)
+    const tokens = JSON.parse(body)
+    expect((await rpc(new URL(resource).pathname, tokens.access_token)).status).toBe(200)
+    const refreshed = await tokenRequest({ grant_type: "refresh_token", refresh_token: tokens.refresh_token })
+    expect(refreshed.status, await refreshed.clone().text()).toBe(200)
+  })
   it("keeps separate connections, checks token audience and exposes seven tools per added service", async () => {
     choose("law"); const law = await exchange()
     choose("g2b"); const g2b = await exchange()
