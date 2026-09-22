@@ -1,0 +1,3 @@
+# Reviewed documentation-only hardcoding example, not an operational credential.
+# This excludes ONE historical finding, not this file, rule, or entire commit.
+821677f0ac3f8bd59cfd21c42176f513a82c9bed:docs/ARCHITECTURE.md:generic-api-key:952
