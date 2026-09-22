@@ -40,6 +40,11 @@
     "gc": "npm run typecheck && npm run dead-code && npm test && npm run build",
     "verify:annex-runtime": "node ./scripts/verify-annex-runtime.mjs",
     "verify:package": "node ./scripts/verify-package.mjs",
+    "security:install": "node ./scripts/install-gitleaks.mjs",
+    "security:setup": "npm run security:install && npm run prepare",
+    "security:staged": "node ./scripts/scan-secrets.mjs staged",
+    "security:history": "node ./scripts/scan-secrets.mjs history",
+    "security:test": "node --test scripts/security-checks.mjs",
     "prepack": "npm run build && npm run verify:package",
     "prepublishOnly": "npm run build && npm run verify:package",
     "prepare": "husky"
@@ -86,7 +91,7 @@
     "hono": "^4.13.1",
     "ip-address": "^10.5.0",
     "sharp": "^0.35.3",
-    "adm-zip": "^0.6.0",
+    "adm-zip": "^0.6.1",
     "onnxruntime-node": "^1.27.0",
     "exceljs": {
       "uuid": "11.1.1"

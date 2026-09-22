@@ -1,0 +1,14 @@
+title = "Korean Law MCP secret detection"
+
+[extend]
+useDefault = true
+
+# Supplement provider rules with the credential names used by our integrations.
+# Do not exclude test files, documentation, or entire commits from scanning.
+[[rules]]
+id = "korean-public-api-key"
+description = "Literal KOSIS or public-data service credential"
+regex = '''(?i)(?:kosis[_-]?(?:token|(?:api[_-]?)?key)|g2b[_-]?(?:(?:api|service)[_-]?)?key|service[_-]?key|나라장터)[\t "']{0,4}[:=][\t "']{0,4}([a-z0-9+/=%_-]{32,})'''
+secretGroup = 1
+entropy = 3.0
+keywords = ["kosis", "g2b", "servicekey", "service_key", "service-key", "나라장터"]

@@ -4,9 +4,14 @@ Thanks for improving Korean Law MCP. The repository layout, tool architecture, a
 
 ## Prerequisites and setup
 
-- Node.js 20.19.0 or newer (the `engines` floor, matching the production host). CI runs the suite on both 20.19.0 and 22.12.0; the published Docker image ships 22.12.0.
+- Node.js 22.13.0 or newer (the `engines` floor). CI runs the suite on 22.13.0 and 24.x.
 - A current checkout based on `main`. Keep generated `build/` output and local credentials out of commits.
 - `LAW_OC` is needed for live 법제처 API calls, but not for the unit test suite.
+
+For local development, enable the credential checks after the dependency install
+with `npm run security:setup`. Unlike dependency lifecycle scripts, this explicitly
+installs the checksum-pinned scanner and activates the reviewed repository hooks.
+See [credential safety](SECURITY.md) for setup, GitHub settings, and incident response.
 
 ```bash
 npm ci --ignore-scripts

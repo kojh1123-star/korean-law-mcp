@@ -3,7 +3,14 @@ build
 dist
 npm-debug.log
 .env
-.env.local
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+.tools
 .git
 .gitignore
 README.md

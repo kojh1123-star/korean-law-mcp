@@ -4,7 +4,16 @@ dist/
 *.log
 .DS_Store
 .env
-.env.local
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+.tools/
 test-*.js
 test-*.mjs
 test-scenarios.mjs
