@@ -21,6 +21,17 @@ describe("maskSensitiveUrl — API 키 마스킹", () => {
   it("빈 문자열은 안전하게 통과", () => {
     expect(maskSensitiveUrl("")).toBe("")
   })
+  it("도구 출력 속 상세링크: 줄 끝에서 멈추고 다음 줄은 보존", () => {
+    const text = "  링크: /DRF/lawService.do?OC=srv&amp;target=expc&amp;ID=1\n  링크: /DRF/lawService.do?target=prec&OC=srv2\n다음 줄"
+    expect(maskSensitiveUrl(text)).toBe(
+      "  링크: /DRF/lawService.do?OC=***&amp;target=expc&amp;ID=1\n  링크: /DRF/lawService.do?target=prec&OC=***\n다음 줄",
+    )
+  })
+  it("HTML 엔티티(&amp;OC=)·URL 인코딩(OC%3D) 형태도 마스킹", () => {
+    expect(maskSensitiveUrl("?target=law&amp;OC=srv&amp;MST=1")).toBe("?target=law&amp;OC=***&amp;MST=1")
+    expect(maskSensitiveUrl("?url=x%3Fy%26OC%3Dsrv")).toBe("?url=x%3Fy%26OC%3D***")
+    expect(maskSensitiveUrl("?serviceKey=abc&numOfRows=10")).toBe("?serviceKey=***&numOfRows=10")
+  })
 })
 
 // #150-7: Retry-After 값을 그대로 믿으면 업스트림 헤더 하나가 대기를 임의로 늘린다

@@ -13,10 +13,15 @@ import { combineAbortSignals, getRequestSignal, requestCancelledError, requestCo
  * URL에서 민감 정보(API 키) 마스킹 — 에러 메시지/로그 노출 방지.
  * 법제처 API는 ?OC=KEY 쿼리 파라미터로 키를 받으므로 해당 값만 *** 처리.
  * 추가 방어로 일반적인 키 파라미터 이름들도 마스킹.
+ * 도구 출력 전체에도 쓰이므로(검색 응답의 `상세링크`에 `OC=`가 박혀 온다) 값은
+ * 공백·따옴표·괄호에서 끊고, `&amp;OC=`(HTML 엔티티)·`%26OC%3D`(URL 인코딩)도 잡는다.
  */
 export function maskSensitiveUrl(url: string): string {
   if (!url) return url
-  return url.replace(/([?&](?:oc|apikey|api_key|authkey|auth_key|key)=)[^&]+/gi, "$1***")
+  return url.replace(
+    /((?:[?&;]|%3F|%26)(?:oc|apikey|api_key|authkey|auth_key|key|servicekey|service_key)(?:=|%3D))[^&#\s"'<>)]+/gi,
+    "$1***",
+  )
 }
 
 export interface FetchWithRetryOptions extends RequestInit {
