@@ -203,4 +203,14 @@ describe("OAuth client compatibility", () => {
     expect((await tools("kosis", kosis.access_token)).status).toBe(200)
     expect((await tools("g2b", latest.access_token)).status).toBe(200)
   })
+
+  it("rejects service path variants that Express would otherwise route to the MCP handler", async () => {
+    const machineList = (path: string) => request(path, {
+      method: "POST", headers: { "x-mcp-token": "test-only-legacy-token", "content-type": "application/json", accept: "application/json, text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+    })
+    // Trailing-slash and case variants have no service; recording one must not crash the process.
+    for (const variant of ["/mcp/", "/MCP", "/g2b/mcp/"]) expect((await machineList(variant)).status, variant).toBe(404)
+    expect((await machineList("/mcp")).status).toBe(200)
+  })
 })

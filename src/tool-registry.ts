@@ -9,6 +9,7 @@ import { z } from "zod"
 import type { LawApiClient } from "./lib/api-client.js"
 import type { McpTool } from "./lib/types.js"
 import { formatToolError } from "./lib/errors.js"
+import { maskSensitiveUrl } from "./lib/fetch-with-retry.js"
 import { RequestExecutionBudget, readExecutionLimits, type ExecutionLimits } from "./lib/execution-limits.js"
 import { truncateResponse } from "./lib/schemas.js"
 import { getRequestSignal, requestContext, runWithRequestContext, throwIfRequestCancelled } from "./lib/session-state.js"
@@ -840,8 +841,10 @@ export function registerTools(
         const input = tool.schema.parse(args)
         const result = await tool.handler(apiClient, input)
         throwIfRequestCancelled()
+        // Upstream detail links carry the requesting OC key (`상세링크`), so mask
+        // before truncating: a cut must never leave a fragment of the key behind.
         const text = truncateResponse(
-          result.content.map(content => content.text).join("\n"),
+          maskSensitiveUrl(result.content.map(content => content.text).join("\n")),
           executionLimits.maxToolResponseChars,
         )
         return {
@@ -858,7 +861,7 @@ export function registerTools(
           content: [{
             type: "text" as const,
             text: truncateResponse(
-              errResult.content.map(content => content.text).join("\n"),
+              maskSensitiveUrl(errResult.content.map(content => content.text).join("\n")),
               executionLimits.maxToolResponseChars,
             ),
           }],

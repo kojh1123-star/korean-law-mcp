@@ -307,8 +307,18 @@ export async function startHTTPServer(
   // POST /mcp - stateless 요청 처리
   const mcpPaths = SERVICE_IDS.map(id => SERVICES[id].path)
   app.post(mcpPaths, async (req, res) => {
-    const service = serviceForPath(req.path)!
-    res.once("finish", () => oauth?.serviceResult(service, res.statusCode >= 400))
+    // Express routes `/mcp/` and `/MCP` here too (non-strict, case-insensitive).
+    // Without an exact service those would skip the law fallback gate, reach the
+    // KOSIS server, and crash the process when the metrics row is written.
+    const service = serviceForPath(req.path)
+    if (!service) {
+      res.status(404).json({ jsonrpc: "2.0", error: { code: -32601, message: "Not found." }, id: null })
+      return
+    }
+    res.once("finish", () => {
+      // A metrics write failure (e.g. a full volume) must not take the server down.
+      try { oauth?.serviceResult(service, res.statusCode >= 400) } catch { /* ignore */ }
+    })
     // Extract API key: header > URL query
     // 쿼리스트링 키는 프록시/엣지 액세스 로그에 평문으로 남으므로 헤더 사용 권장.
     // ALLOW_QUERY_API_KEY=0 으로 쿼리 경로를 차단할 수 있다 (폐쇄망 권장).
