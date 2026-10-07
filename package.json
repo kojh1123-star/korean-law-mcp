@@ -72,7 +72,7 @@
     "express": "^5.2.1",
     "fast-xml-parser": "5.11.1",
     "kordoc": "^4.7.2",
-    "multer": "2.3.0",
+    "multer": "2.4.0",
     "oidc-provider": "9.12.2",
     "pdfjs-dist": "4.10.38",
     "zod": "^4.0.0"
@@ -90,7 +90,8 @@
   "overrides": {
     "hono": "^4.13.1",
     "ip-address": "^10.5.0",
-    "sharp": "^0.35.3",
+    "brace-expansion@1": "^1.1.21",
+    "sharp": "^0.35.5",
     "adm-zip": "^0.6.1",
     "onnxruntime-node": "^1.27.0",
     "exceljs": {
