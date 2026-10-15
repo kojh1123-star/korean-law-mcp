@@ -1,6 +1,6 @@
 # 세션 인계
 
-- 작성: 2026-10-15 22:50 KST (2차 갱신)
+- 작성: 2026-10-15 22:58 KST (3차 갱신)
 - 브랜치: `ccr-1c8cdaf4-l95i9v` (base: `main` @ 3ebaf5e)
 - HEAD: 이 인계 커밋 (레포 코드 변경 없음 — `.claude/` 아래 인계 자료만)
 - PR: 없음
@@ -21,6 +21,10 @@
     표·그래프·SVG 구조, 빈출 키워드 포함, 대분류·색인 일치. `--sources DIR`(원문 텍스트, 파일명=url sha1.txt)로 인용 대조
   - 사용: `python3 check_answers.py answers_EN.json --questions questions.json --keywords keywords.json --index answer_index.json`
   - 기존 LFG 답안(134-4-06) 결과: ERROR 31 (ref·quote 없음, 출처 6건 모두 quote 없음), WARN 1 (cues.rutgers.edu = EPA 문서 미러)
+- [x] 작성 계획표 생성기 `.claude/handoff-assets/gisulsa/make_plan.py` — 문항별 소문항 분해·요구 요소·필수 키워드·형제 문항·권장 목차·근거 유형·우선순위
+  - 사용: `python3 make_plan.py --questions questions.json --keywords keywords.json --minors minors.json --index answer_index.json -o answer_plan.json`
+  - 결과(2026-10-15): 작성 대상 371 (S 서술 101·단답 77 / A 66·52 / B 48·27), 필수 키워드 있는 문항 327, 소문항 분해 40. 1순위 128-4-01·140-2-04(SRF)
+  - 목차·요구 요소는 문항 문구 정규식 추정 — 작성할 때 문항 원문을 보고 조정할 것 (단답 78개는 용어형이라 요구 요소 비어 있음)
 
 ## 남은 작업 (순서대로)
 1. 시범 5개 그룹(17문항) 작성 → 문항당 사용량·근거 미확보 비율 측정
@@ -35,8 +39,8 @@
 5. 모든 작업 끝나면 인계 Close: `.claude/handoff.md`·`.claude/handoff-assets/` 삭제 (main 에 들어가지 않게)
 
 ## 다음 한 걸음
-(노트북 로컬 세션) 법령 MCP·원문 사이트 접속 확인 → Artifact read로 `answers_LF`(`/_blob/1e3f738114423ea2364b05d26bc4a6d0`)·questions·keywords 받기
-→ EN02 SRF 품질기준 그룹(140-2-04부터) 근거 수집 → 답안 작성 → `check_answers.py` ERROR 0 확인 → 대시보드 반영.
+(노트북 로컬 세션) 법령 MCP·원문 사이트 접속 확인 → Artifact read로 `answers_LF`(`/_blob/1e3f738114423ea2364b05d26bc4a6d0`)·questions·keywords·minors·answer_index 받기
+→ `make_plan.py` 로 계획표 생성 → order 순으로 SRF 그룹(128-4-01·140-2-04·119-3-03·111-1-09)부터 근거 수집 → 답안 작성 → `check_answers.py` ERROR 0 확인 → 대시보드 반영.
 
 ## 결정 사항 · 제약
 - 근거: **법령·고시 원문, 정부·공공기관 공식 문서(환경부·국립환경과학원·한국환경공단, US EPA, IPCC, 협약문 등), DOI 있는 동료심사 논문만**. 교과서·수험서·학원 교재·블로그 제외.
