@@ -11,6 +11,7 @@
  */
 import type { LawApiClient } from "./api-client.js"
 import { parsePrecedentXML } from "./xml-parser.js"
+import { throwIfRequestCancelled } from "./session-state.js"
 
 /*
  * 추출 규칙과 그 균형 (#93 → #137)
@@ -31,8 +32,9 @@ import { parsePrecedentXML } from "./xml-parser.js"
  * 여기(CASE_CODES) 한 곳에만 추가하면 두 경로가 같이 살아난다 — #125의 단일 원본이
  * 이 결정을 감당할 만큼 넓어졌기에 가능한 교환이다.
  *
- * 연도·부호·일련번호 사이 공백은 허용하지 않는다("2027 예산 500억원" 차단). 띄어 쓴
- * "2013 다 61381"을 포기하는 대신 오탐 한 부류를 통째로 없앤다.
+ * 연도·부호·일련번호 사이 공백도 받는다. 산문은 실재 부호 목록과 수량 후행 가드로
+ * 차단한다("2027 예산 500억원", "2030 도 3000명"). 띄어 쓴 판례가 법령과 섞여도
+ * 검증 대상에서 빠져 전체 [VERIFIED]로 잘못 인증되지 않게 한다.
  * 선행 `제`·숫자를 막는 것이 조문 인용과의 경계다 — "제999조의9"의 999는 사건연도가 아니다.
  */
 /**
@@ -68,8 +70,11 @@ const CASE_CODES = [
 export const CASE_CODE_PATTERN =
   `(?:${[...CASE_CODES].sort((a, b) => b.length - a.length).join("|")})`
 
+/** 사건 일련번호 문법 — 최대 8자리이며 긴 번호의 앞부분만 읽지 않는다. */
+export const CASE_SERIAL_PATTERN = "\\d{1,8}(?!\\d)"
+
 /** 법원 사건번호 전체 형태 (연도 4자리 + 부호 + 일련번호). 공백 표기를 허용한다. */
-export const COURT_CASE_PATTERN = `(?:19|20)\\d{2}\\s*${CASE_CODE_PATTERN}\\s*\\d{1,8}`
+export const COURT_CASE_PATTERN = `(?:19|20)\\d{2}\\s*${CASE_CODE_PATTERN}\\s*${CASE_SERIAL_PATTERN}`
 
 // 부존재 단정(✗) 전용 게이트. 추출보다 한 단계 더 보수적인 자리다 —
 // 여기서 통과시키면 "지어낸 인용"이라고 사용자에게 단정하게 된다.
@@ -89,8 +94,11 @@ const NON_CASE_SYLLABLES = "명개원건회차호년월일조항목억천"
 // 추출 규칙 (위 주석의 균형 참조). 부호는 CASE_CODES에 실재하는 것만 인정한다.
 // 후행 lookahead에 숫자를 함께 두는 것이 잘림 방어다 — 숫자를 빼면 "…61381명"에서
 // 백트래킹이 "…6138"로 물러나 잘린 사건번호를 만들어낸다.
+// 공백 수량도 차단한다("2030 도 3000 명이"). 공백 뒤는 단위+조사의 어절 경계까지 본다:
+// 단위 음절만 보면 진짜 인용 뒤 "원심"·"조문"까지 오탐으로 지우게 된다.
 const CASE_NO_RE = new RegExp(
-  `(?<![\\d제])(\\d{2,4})(${CASE_CODE_PATTERN})(\\d{1,7})(?![\\d${NON_CASE_SYLLABLES}])`,
+  `(?<![\\d제])(\\d{2,4}) ?(${CASE_CODE_PATTERN}) ?(${CASE_SERIAL_PATTERN})` +
+  `(?![\\d${NON_CASE_SYLLABLES}]| [${NON_CASE_SYLLABLES}](?:으로|로|에서|까지|부터|[을를이가은는에의도만])?(?=$|[^가-힣]))`,
   "g"
 )
 
@@ -99,8 +107,9 @@ export function extractCaseNumbers(text: string): string[] {
   const out: string[] = []
   const seen = new Set<string>()
   let m: RegExpExecArray | null
+  const normalized = (text || "").replace(/\s+/g, " ")
   CASE_NO_RE.lastIndex = 0
-  while ((m = CASE_NO_RE.exec(text || "")) !== null) {
+  while ((m = CASE_NO_RE.exec(normalized)) !== null) {
     const cn = `${m[1]}${m[2]}${m[3]}`
     if (!seen.has(cn)) {
       seen.add(cn)
@@ -175,6 +184,7 @@ async function verifyOne(
       line: `⚠ ${caseNo} — 미확인 (법제처 수록 판례에서 검색되지 않음. 하급심·미수록 판례일 수 있어 부존재로 단정 불가)`,
     }
   } catch (e) {
+    throwIfRequestCancelled()
     return {
       mark: "unknown",
       line: `⚠ ${caseNo} — 미확인 (조회 실패: ${e instanceof Error ? e.message : String(e)})`,

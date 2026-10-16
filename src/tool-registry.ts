@@ -8,8 +8,8 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import { z } from "zod"
 import type { LawApiClient } from "./lib/api-client.js"
 import type { McpTool } from "./lib/types.js"
-import { formatToolError } from "./lib/errors.js"
-import { maskSensitiveUrl } from "./lib/fetch-with-retry.js"
+import { ErrorCodes, formatToolError, LawApiError } from "./lib/errors.js"
+import { maskToolText } from "./lib/tool-output.js"
 import { RequestExecutionBudget, readExecutionLimits, type ExecutionLimits } from "./lib/execution-limits.js"
 import { truncateResponse } from "./lib/schemas.js"
 import { getRequestSignal, requestContext, runWithRequestContext, throwIfRequestCancelled } from "./lib/session-state.js"
@@ -19,6 +19,7 @@ import { searchDecisions, SearchDecisionsSchema, getDecisionText, GetDecisionTex
 
 // Tool imports
 import { searchLaw, SearchLawSchema } from "./tools/search.js"
+import { searchLawBulk, SearchLawBulkSchema } from "./tools/search-bulk.js"
 import { getLawText, GetLawTextSchema } from "./tools/law-text.js"
 import { parseJoCode, ParseJoCodeSchema, getLawAbbreviations, GetLawAbbreviationsSchema } from "./tools/utils.js"
 import { compareOldNew, CompareOldNewSchema } from "./tools/comparison.js"
@@ -88,13 +89,19 @@ export const allTools: McpTool[] = [
   // === 법령 검색/조회 ===
   {
     name: "search_law",
-    description: "[법령검색] 법령명·조례명·행정규칙명 키워드검색 → lawId, mst 획득. 지자체 조례·규칙(자치법규), 훈령·예규·고시(행정규칙)도 검색 — 0건 시 자치법규/행정규칙으로 자동 폴백(예: '광진구 복무조례', '외국환거래규정'). 약칭 자동변환. 제명변경·시행예정 개정 자동 병기. 폐지된 법령·행정규칙은 폐지 사실과 후속(통합) 규정을 자동 안내. 법령·조례·행정규칙 조회 전 식별자 확보용.",
+    description: "[법령검색] 법령명·조례명·행정규칙명 키워드검색 → lawId, mst 획득. 지자체 조례·규칙(자치법규), 훈령·예규·고시(행정규칙)도 검색 — 0건 시 자치법규/행정규칙으로 자동 폴백(예: '광진구 복무조례', '외국환거래규정'). 약칭 자동변환. 제명변경·시행예정 개정 자동 병기. 폐지된 법령·행정규칙은 폐지 사실과 후속(통합) 규정을 자동 안내. 법령·조례·행정규칙 조회 전 식별자 확보용. 여러 법령의 개정 여부를 한 번에 확인(준법 등록부 감시)하려면 execute_tool(tool_name=\"search_law_bulk\").",
     schema: SearchLawSchema,
     handler: searchLaw
   },
   {
+    name: "search_law_bulk",
+    description: "[법령검색] 법령명 배열을 한 번에 조회 — 건당 법령ID·MST·시행일·시행예정만 컴팩트 반환(부분매칭 목록·안내문 없음). previous={법령ID:직전MST} 를 주면 MST가 달라진 법령만 돌려주는 diff 모드 — MST는 개정마다 바뀌므로 그 자체가 변경 감지 키다. ISO 준법 등록부처럼 수십 건의 개정 여부를 주기적으로 확인할 때 search_law 건당 호출 대신 사용.",
+    schema: SearchLawBulkSchema,
+    handler: searchLawBulk
+  },
+  {
     name: "get_law_text",
-    description: "[법령조회] 조문 전문 조회. mst/lawId 필수, jo로 특정 조문만 가능 — jo는 '제148조의2' 같은 자연어 조문 표기를 그대로 받는다(권장). 6자리 JO 코드를 직접 쓰려면 조번호 4자리 zero-pad + 의X 2자리: 제10조의2→001002, 제234조의2→023402(234002 아님).",
+    description: "[법령조회] 조문 전문 조회. mst/lawId 필수, jo로 특정 조문만 가능 — jo는 '제148조의2' 같은 자연어 조문 표기를 그대로 받는다(권장). 6자리 JO 코드를 직접 쓰려면 조번호 4자리 zero-pad + 의X 2자리: 제10조의2→001002, 제234조의2→023402(234002 아님). jo='부칙' 이면 부칙 원문(시행일·경과조치, 최근 공포부터). 과거 시점 본문은 efYd 에 그 날짜를 넣으면 그날 시행 중이던 버전으로 자동 보정한다(제명이 바뀌기 전 버전 포함). 적용 법령 판단·경과조치까지 필요하면 legal_analysis(mode=applicable_law).",
     schema: GetLawTextSchema,
     handler: getLawText
   },
@@ -126,19 +133,19 @@ export const allTools: McpTool[] = [
   // === 행정규칙 ===
   {
     name: "search_admin_rule",
-    description: "[행정규칙] 훈령/예규/고시/지침 검색. knd 파라미터로 종류 필터 가능(1=훈령, 2=예규, 3=고시). 현행 0건이면 연혁을 자동 추적해 폐지(폐지사유·후속 통합 규정)·제명변경을 안내.",
+    description: "[행정규칙] 훈령/예규/고시/지침 검색. knd 파라미터로 종류 필터 가능(1=훈령, 2=예규, 3=고시). 현행 0건이면 연혁을 자동 추적해 폐지(폐지사유·후속 통합 규정)·제명변경을 안내. history=true면 행정규칙ID별 발령 연혁표(옛 명칭 시절까지 — 화재안전기준 NFSC→NFPC 등).",
     schema: SearchAdminRuleSchema,
     handler: searchAdminRule
   },
   {
     name: "get_admin_rule",
-    description: "[행정규칙] 행정규칙 전문 조회.",
+    description: "[행정규칙] 행정규칙 전문 조회. 전문이 긴 규칙(외국환거래규정 등)은 jo(조문 단위, 예: '제9-5조', 화재안전기술기준은 절 번호 '2.7.3')·chapter(장)·keyword(본문 검색)·page(페이징) 파라미터로 부분 조회 — 파라미터 없이 호출하면 앞부분 5만 자에서 잘린다. 연혁 일련번호를 넣으면 그 시절 본문(연혁본 표시).",
     schema: GetAdminRuleSchema,
     handler: getAdminRule
   },
   {
     name: "compare_admin_rule_old_new",
-    description: "[행정규칙] 행정규칙 신구법 비교. query로 검색, id로 본문 대조표 조회.",
+    description: "[행정규칙] 행정규칙 신구법 비교. query로 검색, id로 본문 대조표 조회. 신구대조 데이터가 없는 규칙은 제·개정이유(개정문 요지)로 자동 대체 반환.",
     schema: CompareAdminRuleOldNewSchema,
     handler: compareAdminRuleOldNew
   },
@@ -166,7 +173,7 @@ export const allTools: McpTool[] = [
   // === 법령-자치법규 연계 ===
   {
     name: "get_linked_ordinances",
-    description: "[연계] 법령 기준 자치법규 연계 목록. 특정 법령과 관련된 전국 조례/규칙 조회.",
+    description: "[연계] 자치법규와 연계된 법령 목록. 법령-조례 조문 대응은 get_linked_ordinance_articles로 조회.",
     schema: LinkedOrdinancesSchema,
     handler: getLinkedOrdinances
   },
@@ -178,13 +185,13 @@ export const allTools: McpTool[] = [
   },
   {
     name: "get_delegated_laws",
-    description: "[연계] 위임법령 목록. 소관부처별 위임법령(시행령/시행규칙 미제정) 조회.",
+    description: "[연계] 소관부처별 위임 연계 자치법규 목록. 조회 페이지 최대 100건 내에서 부처 필터 적용.",
     schema: DelegatedLawsSchema,
     handler: getDelegatedLaws
   },
   {
     name: "get_linked_laws_from_ordinance",
-    description: "[연계] 자치법규 기준 상위법령 조회. 조례/규칙의 근거 법령 확인.",
+    description: "[연계] 법령과 연계된 자치법규 목록. 근거 상위법령은 해당 자치법규 본문에서 확인.",
     schema: LinkedLawsFromOrdinanceSchema,
     handler: getLinkedLawsFromOrdinance
   },
@@ -212,7 +219,7 @@ export const allTools: McpTool[] = [
   // === 부가정보 ===
   {
     name: "get_annexes",
-    description: "[별표] 별표/서식 조회. lawName+'별표N'으로 내용 추출. 금액/기준은 별표에 있는 경우 많음.",
+    description: "[별표] 별표/서식 조회. lawName+'별표N'으로 내용 추출. 금액/기준은 별표에 있는 경우 많음. date(기준일)를 주면 그날 시행 중이던 버전의 별표 — 건축허가·착공·처분 시점의 설치기준·과태료표 등 과거 기준이 필요할 때(제명이 바뀐 법령도 옛 버전까지, 별표 번호가 시점마다 달라 query로 별표명을 주는 편이 안전).",
     schema: GetAnnexesSchema,
     handler: getAnnexes
   },
@@ -262,13 +269,13 @@ export const allTools: McpTool[] = [
   },
   {
     name: "get_historical_law",
-    description: "[이력] 특정 시점 연혁법령 조회.",
+    description: "[이력] 특정 시점 연혁법령 조회 — search_historical_law가 준 MST와 시행일(efYd)을 함께 넘긴다.",
     schema: getHistoricalLawSchema,
     handler: getHistoricalLaw
   },
   {
     name: "search_historical_law",
-    description: "[이력] 연혁법령 검색.",
+    description: "[이력] 연혁법령 검색 — 법령ID 계보로 제명이 바뀌기 전 버전까지 시행일별 전 목록(제명 변천 병기). 약칭·옛 법령명도 받는다.",
     schema: searchHistoricalLawSchema,
     handler: searchHistoricalLaw
   },
@@ -608,7 +615,7 @@ export const allTools: McpTool[] = [
   },
   {
     name: "legal_analysis",
-    description: "[정밀분석] 검증·분석 4종 통합. mode: verify_citations=텍스트 속 법령 조문·판례 인용('민법 제750조', '대법원 2013다61381' 등)이 실존하는지 법제처 DB 교차검증, LLM 환각 방지 — 판례는 실존불가/미확인 구분(text 필수) | cite_check=판례 생사 확인 — 사건번호로 후속 인용 역추적+변경·폐기 감지, 한국형 Citator(caseNumber 필수) | applicable_law=사건 시점에 시행되던 법령 버전+그 시점 조문+부칙 경과조치, 행위시법 판단(lawName+date 필수, jo 선택) | impact_map=한 조문을 인용한 판례·헌재·해석례·행심·조례 역방향 그래프+mermaid(lawName+jo 필수, jo는 '제103조'·'103조'·JO 6자리 코드 '010300' 모두 수용)",
+    description: "[정밀분석] 검증·분석 4종 통합. mode: verify_citations=텍스트 속 법령 조문·판례 인용('민법 제750조', '대법원 2013다61381' 등)이 실존하는지 법제처 DB 교차검증, LLM 환각 방지 — 판례는 실존불가/미확인 구분(text 필수) | cite_check=판례 생사 확인 — 사건번호로 후속 인용 역추적+변경·폐기 감지, 한국형 Citator(caseNumber 필수) | applicable_law=사건 시점에 시행되던 법령 버전+그 시점 조문+부칙 경과조치, 행위시법 판단(lawName+date 필수, jo 선택). 제명이 바뀐 법령은 옛 이름 시절 버전으로 특정. 법령이 아니면 행정규칙(고시·훈령 — 예: '스프링클러설비의 화재안전기준', 'NFTC 103')의 기준일 시행 버전 | impact_map=한 조문을 인용한 판례·헌재·해석례·행심·조례 역방향 그래프+mermaid(lawName+jo 필수, jo는 '제103조'·'103조'·JO 6자리 코드 '010300' 모두 수용)",
     schema: LegalAnalysisSchema,
     handler: legalAnalysis
   },
@@ -722,13 +729,13 @@ export const allTools: McpTool[] = [
   // === 통합 도구 (v3) ===
   {
     name: "search_decisions",
-    description: "[통합검색] 18개 도메인(판례·해석례·헌재·행심·조세심판·관세·국세청·공정위·개인정보위·노동위·권익위·소청심사·학칙·공사공단·공공기관·조약·영문법령) 통합 검색. domain으로 선택. 판례 본문까지 필요하면 domain='precedent', options.includeText=true, options.detailLimit=N. 세무 관련 국세청 직접 회신 해석은 domain='nts'.",
+    description: "[통합검색] 21개 도메인(판례·해석례·헌재·행심·조세심판·관세·국세청·고용노동부 해석·공정위·개인정보위·노동위·산재보험재심사·고용보험심사·권익위·소청심사·학칙·공사공단·공공기관·조약·영문법령) 통합 검색. domain으로 선택. 판례 본문까지 필요하면 domain='precedent', options.includeText=true, options.detailLimit=N. 판례 기본은 판례명 검색이라 법리·사실관계·유사판례 탐색은 options.search='both'(판례명+본문). 세무 관련 국세청 직접 회신 해석은 domain='nts', 고용노동부 행정해석(질의회시)은 domain='moel'(본문검색 options.search=2), 산재보험 재심사 재결은 'iaciac', 고용보험 재심사 재결은 'eiac'.",
     schema: SearchDecisionsSchema,
     handler: searchDecisions
   },
   {
     name: "get_decision_text",
-    description: "[통합조회] 18개 도메인 전문 조회. domain+id. full=false(기본) 시 본문 계단식 축약",
+    description: "[통합조회] 21개 도메인 전문 조회. domain+id. full=false(기본) 시 본문 계단식 축약",
     schema: GetDecisionTextSchema,
     handler: getDecisionText
   },
@@ -799,13 +806,11 @@ const exposedTools = allTools.filter(t => V3_EXPOSED.has(t.name))
 /** 노출/전체 도구 수 — 헬스체크 등 표기용 파생값 (하드코딩 금지) */
 export const TOOL_COUNTS = { exposed: exposedTools.length, total: allTools.length }
 
-export function registerTools(
-  server: Server,
-  apiClient: LawApiClient,
-  executionLimits: ExecutionLimits = readExecutionLimits(),
-) {
-  // ListTools 핸들러
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+// tools/list 응답은 정적이다. HTTP stateless 모드는 POST 마다 서버를 새로 만들어 매번
+// Zod → JSON Schema 변환을 10회씩 반복했다. 첫 요청에 한 번 만들고 재사용한다.
+let listToolsResult: { tools: object[] } | undefined
+function listTools() {
+  listToolsResult ??= {
     tools: exposedTools.map(tool => ({
       name: tool.name,
       description: `${SERVICE_NAME} — ${tool.description}`,
@@ -817,7 +822,52 @@ export function registerTools(
         openWorldHint: true,
       }
     }))
-  }))
+  }
+  return listToolsResult
+}
+
+/**
+ * 인자 문자열 길이 상한. 스키마 대부분에 .max() 가 없어 100KB 인자가 그대로 정규식에
+ * 들어갔고, 공백·쉼표·숫자 반복만으로 이벤트 루프가 12~24초 멈췄다(2026-09-23 리뷰 C1~C4,
+ * 실측: get_annexes lawName 10만 자 19.3초, legal_research document_review 11.9초).
+ * 본문을 받는 `text` 만 5만 자, 나머지는 2천 자(체인 query 의 기존 상한 #121 과 같다).
+ * execute_tool 의 params 처럼 중첩된 인자도 본다.
+ */
+export const MAX_ARG_CHARS = 2_000
+export const MAX_TEXT_ARG_CHARS = 50_000
+/**
+ * 조문·별표 번호류는 정상값이 수십 자다. buildJO(LexDiff, 수정 금지)의 정규식이 숫자 연속에
+ * O(n²) 라 2천 자에서도 1회 94ms 였고, articles 배열로 여러 번 부르면 수 초가 된다(2026-09-23 독립 리뷰).
+ */
+export const MAX_SHORT_ARG_CHARS = 100
+const SHORT_ARG_KEYS = new Set(["jo", "articles", "annexNo", "bylSeq", "hang", "ho", "mok"])
+
+export function findOversizedArg(value: unknown, key = "", depth = 0): string | null {
+  if (typeof value === "string") {
+    const limit = key === "text" ? MAX_TEXT_ARG_CHARS : SHORT_ARG_KEYS.has(key) ? MAX_SHORT_ARG_CHARS : MAX_ARG_CHARS
+    return value.length > limit ? `${key || "인자"} ${value.length}자 (상한 ${limit}자)` : null
+  }
+  if (depth >= 5 || value === null || typeof value !== "object") return null
+  const entries: Array<[string, unknown]> = Array.isArray(value) ? value.map(v => [key, v]) : Object.entries(value)
+  for (const [k, v] of entries) {
+    const hit = findOversizedArg(v, k, depth + 1)
+    if (hit) return hit
+  }
+  return null
+}
+
+/** 출력 최종 게이트: 키 마스킹 → 길이 절단 (마스킹이 길이를 늘리지 않으므로 이 순서가 안전) */
+function finalizeText(text: string, maxChars: number, args?: Record<string, unknown>): string {
+  return truncateResponse(maskToolText(text, args), maxChars)
+}
+
+export function registerTools(
+  server: Server,
+  apiClient: LawApiClient,
+  executionLimits: ExecutionLimits = readExecutionLimits(),
+) {
+  // ListTools 핸들러
+  server.setRequestHandler(ListToolsRequestSchema, async () => listTools())
 
   // CallTool 핸들러 — 전체 도구 실행 가능 (execute_tool 프록시 지원)
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
@@ -838,14 +888,19 @@ export function registerTools(
 
       try {
         throwIfRequestCancelled()
+        const oversized = findOversizedArg(args)
+        if (oversized) {
+          throw new LawApiError(`인자가 너무 깁니다: ${oversized}`, ErrorCodes.INVALID_PARAM, [
+            `조문·별표 번호는 ${MAX_SHORT_ARG_CHARS}자, 법령명·검색어는 ${MAX_ARG_CHARS}자, 본문(text)은 ${MAX_TEXT_ARG_CHARS}자까지 받습니다. 필요한 부분만 잘라 다시 호출하세요.`,
+          ])
+        }
         const input = tool.schema.parse(args)
         const result = await tool.handler(apiClient, input)
         throwIfRequestCancelled()
-        // Upstream detail links carry the requesting OC key (`상세링크`), so mask
-        // before truncating: a cut must never leave a fragment of the key behind.
-        const text = truncateResponse(
-          maskSensitiveUrl(result.content.map(content => content.text).join("\n")),
+        const text = finalizeText(
+          result.content.map(content => content.text).join("\n"),
           executionLimits.maxToolResponseChars,
+          args,
         )
         return {
           content: [{ type: "text" as const, text }],
@@ -860,9 +915,10 @@ export function registerTools(
         return {
           content: [{
             type: "text" as const,
-            text: truncateResponse(
-              maskSensitiveUrl(errResult.content.map(content => content.text).join("\n")),
+            text: finalizeText(
+              errResult.content.map(content => content.text).join("\n"),
               executionLimits.maxToolResponseChars,
+              args,
             ),
           }],
           isError: true,

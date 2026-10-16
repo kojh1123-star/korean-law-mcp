@@ -25,6 +25,10 @@ import { formatToolError } from "../lib/errors.js"
 import { toArray } from "../lib/xml-parser.js"
 import { matchCitationContent } from "../lib/citation-content-matcher.js"
 import { verifyCaseCitations } from "../lib/case-citation.js"
+import { fetchLineageVersions, sameLawName, todayKst, versionInForce } from "../lib/law-lineage.js"
+import { rethrowIfFatal } from "../lib/fatal-errors.js"
+import { getRequestSignal, throwIfRequestCancelled } from "../lib/session-state.js"
+import type { HistoricalVersion } from "../lib/historical-utils.js"
 
 export const VerifyCitationsSchema = z.object({
   text: z.string().min(1).describe("검증할 법률 텍스트 (LLM 답변/계약서/판결문 등). 조문 인용이 포함된 문자열"),
@@ -57,12 +61,17 @@ const LAW_NAME_REGEX = new RegExp(
 )
 
 // 법령명 앞에 붙는 한국어 접속사·부사·수식어 제거 — "또한 상법" → "상법"
-const LAW_NAME_STOPWORDS = /^(또한|그리고|하며|따라서|따라|위해|위하여|의한|의하여|따른|해당|관련|이에|아울러|본|이|저|그|또|및|또는|혹은|한편|더불어|이어|이는|즉|결국|결과적으로|실제로|특히)\s+/u
+const LAW_NAME_STOPWORDS = /^(또한|그리고|하며|따라서|따라|위해|위하여|의한|의하여|따른|해당|관련|이에|아울러|본|이|저|그|또|및|또는|혹은|한편|더불어|이어|이는|즉|결국|결과적으로|실제로|특히|와|과|내지)\s+/u
 
 // 그 자체로는 법령명이 될 수 없는 접미사 어절. 후보 축약이 앞 어절을 다 떼고 나면
 // 이런 토큰만 남는데("같은 법 시행규칙" → "시행규칙"), 검색에 넣으면 어떤 문서에서든
 // 무관한 법령을 물어온다(#70: "시행규칙" → '119긴급신고의 관리 및 운영에 관한 법률 시행규칙').
 const LAW_NAME_SUFFIX_TOKENS = new Set(["법", "법률", "시행령", "시행규칙", "규칙", "규정", "조례"])
+
+// 법령명 앞머리가 될 수 없는 어절 — 관형 표현("관한")·접속어("및")로 시작하는 후보.
+// 조사로 끝나는 첫 어절은 거르지 않는다: 「독립유공자예우에 관한 법률」·「공공기관의 운영에 관한 법률」·「국가를 당사자로 하는
+// 소송에 관한 법률」처럼 실존 법령의 첫 어절이다("~에"까지 거르자 "구 독립유공자예우에 관한 법률 제4조"가 환각 판정됐다, 리뷰 실측).
+const FRAGMENT_HEAD_RE = /^(?:관한|대한|관하여|대하여|위한|의한|따른|및|또는|등)\s/
 
 // 캡처된 법령명 앞에 내용어 수식어가 남을 수 있음(예: "절도죄는 형법", "이혼시 재산분할은 민법").
 // 앞 어절을 하나씩 떼며 검색 후보를 만든다. 전체(full)를 먼저 두어 다어절 법령명
@@ -153,6 +162,9 @@ export function parseCitations(text: string, maxCitations: number): ParsedCitati
   // "같은 법"·"동법" 조응 해소용 — 문서 순서대로 순회하므로 직전에 추출된 법령명을 들고 간다.
   let antecedent: string | undefined
   let antecedentEnd = 0
+  // 직전 인용의 끝. 역추적 창이 그 앞으로 넘어가면 앞 인용의 꼬리를 법령명으로 삼킨다
+  // ("민법 제751조와 민법 제756조" → "조와 민법", 2026-09-28 성능 감사: 무의미한 검색 1회 + 캐시 우회)
+  let prevCitationEnd = 0
 
   ARTICLE_REGEX.lastIndex = 0
   let m: RegExpExecArray | null
@@ -160,9 +172,10 @@ export function parseCitations(text: string, maxCitations: number): ParsedCitati
     const [raw, joStr, branchStr, hangStr, hoStr] = m
     if (!joStr) continue
 
-    // 직전 30자에서 법령명 역추적
-    const lookbackStart = Math.max(0, m.index - 30)
+    // 직전 30자에서 법령명 역추적 (직전 인용 뒤로만)
+    const lookbackStart = Math.max(0, m.index - 30, prevCitationEnd)
     const lookback = text.slice(lookbackStart, m.index)
+    prevCitationEnd = m.index + raw.length
 
     let lawName: string | undefined
     const anaphora = lookback.match(LAW_ANAPHORA_TAIL_REGEX)
@@ -231,9 +244,195 @@ function formatCitationLabel(c: ParsedCitation, officialName?: string): string {
   return label
 }
 
+/** 인용된 법령명 하나를 법제처 법령으로 특정한 결과. 같은 법령명의 인용들이 이 결과를 공유한다. */
+type LawResolution =
+  | { kind: "no_candidates" }
+  | { kind: "chosen"; law: LawInfo }
+  | { kind: "repealed"; law: LawInfo }
+  | { kind: "renamed"; old: LawInfo; current: HistoricalVersion; lastOld?: HistoricalVersion }
+  | { kind: "not_found" }
+  | { kind: "loose_only"; fallback: LawInfo }
+  | { kind: "error"; message: string }
+
+async function resolveCitedLaw(
+  apiClient: LawApiClient,
+  lawName: string,
+  apiKey?: string
+): Promise<LawResolution> {
+  // 1단계: 법령 검색 — findLaws가 관련도 정렬까지 처리 (민법→난민법 오매칭 방지)
+  // 앞 수식어가 남은 캡처("절도죄는 형법")도 후보를 순차 축약하며 실제 법령명을 찾는다.
+  let fallback: LawInfo | undefined   // 어떤 후보도 looseMatch 실패 시 ⚠ 메시지용 (전체 캡처 기준)
+  // 후보가 하나도 없으면(접미사뿐인 캡처, #70) 검색을 시도하지 않는다 — 시도하면 무관 법령이
+  // 물려오고, 검색 결과가 0이면 ✗ NOT_FOUND 로 낙인돼 '법령명 미상'이 '환각'으로 오보된다.
+  // 꼬리 후보 중 첫 어절이 "관한·대한·및" 류면 법령명의 앞머리가 될 수 없다("관한 법률"·"및 안전관리에 관한 법률").
+  // 이런 후보는 어떤 검색에도 무언가를 물어와 지어낸 법령 한 건에 업스트림 12회를 태웠다(2026-09-28 성능 감사).
+  // 원문 전체 후보(첫 번째)는 거르지 않는다 — 「국가를 당사자로 하는 소송에 관한 법률」처럼 첫 어절이 조사로 끝나는 법령이 있다.
+  const candidates = lawNameCandidates(lawName).filter((c, i) => i === 0 || !FRAGMENT_HEAD_RE.test(c))
+  if (candidates.length === 0) return { kind: "no_candidates" }
+  try {
+    for (const cand of candidates) {
+      // searchDisplay=100: "상법"처럼 짧은 법령명이 부분매칭에 밀려 기본 20건에 안 들어올 때 대비
+      const results = await findLaws(apiClient, cand, apiKey, 5, 100)
+      if (results.length === 0) continue
+      if (!fallback) fallback = results[0]
+      if (looseMatchLawName(cand, results[0].lawName)) return { kind: "chosen", law: results[0] }
+    }
+    // 현행(target=law)에서 이 법령을 특정하지 못함 → 폐지된 법령인지 연혁(eflaw)에서 확인.
+    // '지어낸 인용(환각)'과 '실존했으나 폐지된 법령'을 구분(존재≠생존).
+    //
+    // fallback 유무와 무관하게 확인한다 — 후보 축약이 만드는 꼬리 후보('기본법',
+    // '관한 법률')는 어떤 문서에서든 무언가를 물어와 fallback을 세우므로, fallback을
+    // 조건으로 걸면 다어절 폐지 법령이 ⌛ 대신 ⚠로 강등된다(pickRepealed가 완전일치·
+    // 접두만 허용해 꼬리 후보가 엉뚱한 폐지본을 물어올 여지는 없다).
+    // 이 단계는 대개 "없음"으로 끝나 후보를 다 돈다(지어낸 인용). 순서대로 기다리지 않고 함께 묻고, 앞 후보를 우선한다.
+    const repealed = (await Promise.all(candidates.map(cand => findRepealedLaw(apiClient, cand, apiKey)))).find(Boolean)
+    if (repealed) return (await renamedLineage(apiClient, repealed, apiKey)) ?? { kind: "repealed", law: repealed }
+    return fallback ? { kind: "loose_only", fallback } : { kind: "not_found" }
+  } catch (e) {
+    throwIfRequestCancelled()
+    return { kind: "error", message: e instanceof Error ? e.message : String(e) }
+  }
+}
+
+/**
+ * 연혁으로만 잡힌 법령이 폐지가 아니라 제명 변경인지 — 같은 법령ID 계보에 이름이 다른 현행이 있으면 개명이다.
+ * 옛 이름 인용(「화재예방, 소방시설 설치ㆍ유지 및 안전관리에 관한 법률」)을 "폐지된 법령"으로 답하면 후속 법령을 찾아 헤매게 된다.
+ * 계보 조회 실패는 종전 "폐지" 판정으로 둔다.
+ */
+async function renamedLineage(apiClient: LawApiClient, old: LawInfo, apiKey?: string): Promise<LawResolution | undefined> {
+  if (!old.lawId) return undefined
+  try {
+    const { versions } = await fetchLineageVersions(apiClient, old.lawId, apiKey)
+    const today = todayKst()
+    const current = versionInForce(versions, today)   // 폐지됐으면 undefined — 그때는 종전대로 "폐지"
+    if (!current || sameLawName(current.lawNm, old.lawName)) return undefined
+    const lastOld = versions.find(v => sameLawName(v.lawNm, old.lawName) && v.efYd <= today)
+    return { kind: "renamed", old, current, lastOld }
+  } catch (error) {
+    rethrowIfFatal(error)
+    return undefined
+  }
+}
+
+/** 조문 범위 힌트 " (존재 범위: 제N조~제M조)". 장식 정보라 실패는 빈 문자열로 둔다(판정을 바꾸지 않는다). */
+async function articleRangeHint(apiClient: LawApiClient, mst: string, apiKey?: string): Promise<string> {
+  try {
+    const fullJson = JSON.parse(await apiClient.getLawText({ mst, apiKey }))
+    const fullRaw = fullJson?.법령?.조문?.조문단위
+    const fullUnits = toArray<any>(fullRaw)
+    const nums = fullUnits
+      .filter((u: any) => u.조문여부 === "조문" && u.조문번호)
+      .map((u: any) => parseInt(u.조문번호, 10))
+      .filter((n: number) => !isNaN(n))
+    if (nums.length > 0) {
+      return ` (존재 범위: 제${Math.min(...nums)}조~제${Math.max(...nums)}조)`
+    }
+  } catch { throwIfRequestCancelled() }
+  return ""
+}
+
+/**
+ * 한 번의 verify_citations 호출 안에서 공유하는 조회 메모 (2026-09-23 리뷰 B#3).
+ * 같은 법령을 여러 번 인용한 문서가 흔하다("민법 제750조, 민법 제751조 …"). 인용마다 법령 확인과
+ * 전문 조회(범위 힌트)를 따로 하면 같은 업스트림 요청이 인용 수만큼 반복돼 요청 예산이 먼저 바닥난다.
+ */
+interface VerifyMemo {
+  resolveLaw(lawName: string): Promise<LawResolution>
+  rangeHint(mst: string): Promise<string>
+}
+
+function createVerifyMemo(apiClient: LawApiClient, apiKey?: string): VerifyMemo {
+  const laws = new Map<string, Promise<LawResolution>>()
+  const ranges = new Map<string, Promise<string>>()
+  return {
+    resolveLaw(lawName) {
+      let p = laws.get(lawName)
+      if (!p) {
+        p = resolveCitedLaw(apiClient, lawName, apiKey)
+        laws.set(lawName, p)
+      }
+      return p
+    },
+    rangeHint(mst) {
+      let p = ranges.get(mst)
+      if (!p) {
+        p = articleRangeHint(apiClient, mst, apiKey)
+        ranges.set(mst, p)
+      }
+      return p
+    },
+  }
+}
+
+/**
+ * 인용 검증 동시 실행 상한 (2026-09-23 리뷰 B#3).
+ * 전건을 Promise.all 로 한꺼번에 띄우면 모든 인용의 재시도 사다리가 나란히 진행하다가 요청 예산이
+ * 바닥나는 순간 전부가 함께 실패한다(실측 재현: 같은 법령 인용 12건 이상이면 ✓ 0건). 풀로 돌리면
+ * 앞선 인용은 끝까지 검증되고 예산 초과는 뒤쪽 일부에만 남는다. 업스트림 예의도 같은 방향이다.
+ */
+// 4 로 두면 업스트림이 느릴 때(왕복 2초) 인용 30건이 20초가 걸렸다. 법령명 메모로 중복 검색은 이미 없으므로
+// 8 이면 호출 수는 같고 대기만 절반이다(2026-09-23 독립 리뷰).
+const VERIFY_CONCURRENCY = 8
+
+async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length)
+  let next = 0
+  const worker = async (): Promise<void> => {
+    while (next < items.length) {
+      throwIfRequestCancelled()
+      const index = next++
+      results[index] = await fn(items[index])
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker))
+  return results
+}
+
+/**
+ * 원문 그대로의 법령명(첫 후보) 현행 검색 한 번으로 특정되는가. 검증 순서만 정한다 — 판정은 resolveCitedLaw 가
+ * 같은 검색으로 다시 내리고, 요청 안에서는 findLaws 메모가 그 검색을 공유해 업스트림을 다시 치지 않는다.
+ * 그래서 실패(예산 소진 포함)도 여기서는 "특정 안 됨"으로만 두고, 실패 문구는 판정 단계가 붙인다.
+ */
+async function identifiedByFirstCandidate(apiClient: LawApiClient, lawName: string, apiKey?: string): Promise<boolean> {
+  const first = lawNameCandidates(lawName)[0]
+  if (!first) return false
+  try {
+    const results = await findLaws(apiClient, first, apiKey, 5, 100)
+    return results.length > 0 && looseMatchLawName(first, results[0].lawName)
+  } catch {
+    throwIfRequestCancelled()
+    return false
+  }
+}
+
+/**
+ * 현행 검색 첫 후보로 바로 특정되는 법령의 인용부터 검증한다. 결과는 문서 순서 그대로 돌려준다.
+ * 지어낸 다어절 법령명은 후보 축약·연혁 탐색으로 법령명당 업스트림을 8회 안팎 쓴다. 문서 순서대로 돌리면 그 탐색이
+ * 요청 예산(48회)을 먼저 태워 뒤의 실재 인용이 "조문 조회 실패"로 남았다(2026-10-01 감사 재현: 지어낸 법령 8건 + 민법 2건 → ✓0).
+ * 후보 수 상한은 쓰지 않았다: 2개로 묶으면 실재 법령이 셋째 후보인 "이혼시 재산분할은 민법"이 ⚠로 떨어지고, 3개로는 감사 재현을 못 막는다.
+ */
+async function verifyInPriorityOrder(
+  apiClient: LawApiClient,
+  citations: ParsedCitation[],
+  memo: VerifyMemo,
+  apiKey?: string
+): Promise<string[]> {
+  const names = [...new Set(citations.flatMap((c) => (c.lawName ? [c.lawName] : [])))]
+  const hits = await mapWithConcurrency(names, VERIFY_CONCURRENCY, (name) => identifiedByFirstCandidate(apiClient, name, apiKey))
+  const identified = new Set(names.filter((_, i) => hits[i]))
+  const rank = (c: ParsedCitation) => (c.lawName && identified.has(c.lawName) ? 0 : 1)
+  const order = citations.map((_, i) => i).sort((a, b) => rank(citations[a]) - rank(citations[b]))
+  const results = new Array<string>(citations.length)
+  await mapWithConcurrency(order, VERIFY_CONCURRENCY, async (i) => {
+    results[i] = await verifyOne(apiClient, citations[i], memo, apiKey)
+  })
+  return results
+}
+
 async function verifyOne(
   apiClient: LawApiClient,
   cite: ParsedCitation,
+  memo: VerifyMemo,
   apiKey?: string
 ): Promise<string> {
   const inputLabel = formatCitationLabel(cite)
@@ -242,50 +441,28 @@ async function verifyOne(
     return `⚠ ${inputLabel} — 법령명 추출 실패 (앞 문맥에 법령명 명시 필요)`
   }
 
-  // 1단계: 법령 검색 — findLaws가 관련도 정렬까지 처리 (민법→난민법 오매칭 방지)
-  // 앞 수식어가 남은 캡처("절도죄는 형법")도 후보를 순차 축약하며 실제 법령명을 찾는다.
-  let chosen: LawInfo | undefined
-  let fallback: LawInfo | undefined   // 어떤 후보도 looseMatch 실패 시 ⚠ 메시지용 (전체 캡처 기준)
-  // 후보가 하나도 없으면(접미사뿐인 캡처, #70) 검색을 시도하지 않는다 — 시도하면 무관 법령이
-  // 물려오고, 검색 결과가 0이면 ✗ NOT_FOUND 로 낙인돼 '법령명 미상'이 '환각'으로 오보된다.
-  const candidates = lawNameCandidates(cite.lawName)
-  if (candidates.length === 0) {
+  const resolution = await memo.resolveLaw(cite.lawName)
+  if (resolution.kind === "no_candidates") {
     return `⚠ ${inputLabel} — 법령명 불명확 ('${cite.lawName}'은(는) 법령명으로 특정할 수 없음. 앞 문맥에 법령명 명시 필요)`
   }
-  try {
-    for (const cand of candidates) {
-      // searchDisplay=100: "상법"처럼 짧은 법령명이 부분매칭에 밀려 기본 20건에 안 들어올 때 대비
-      const results = await findLaws(apiClient, cand, apiKey, 5, 100)
-      if (results.length === 0) continue
-      if (!fallback) fallback = results[0]
-      if (looseMatchLawName(cand, results[0].lawName)) {
-        chosen = results[0]
-        break
-      }
-    }
-    if (!chosen) {
-      // 현행(target=law)에서 이 법령을 특정하지 못함 → 폐지된 법령인지 연혁(eflaw)에서 확인.
-      // '지어낸 인용(환각)'과 '실존했으나 폐지된 법령'을 구분(존재≠생존).
-      //
-      // fallback 유무와 무관하게 확인한다 — 후보 축약이 만드는 꼬리 후보('기본법',
-      // '관한 법률')는 어떤 문서에서든 무언가를 물어와 fallback을 세우므로, fallback을
-      // 조건으로 걸면 다어절 폐지 법령이 ⌛ 대신 ⚠로 강등된다(pickRepealed가 완전일치·
-      // 접두만 허용해 꼬리 후보가 엉뚱한 폐지본을 물어올 여지는 없다).
-      for (const cand of candidates) {
-        const repealed = await findRepealedLaw(apiClient, cand, apiKey)
-        if (repealed) {
-          const d = formatYmd(repealed.effectiveDate)
-          return `⌛ ${formatCitationLabel(cite, repealed.lawName)} — [REPEALED] 「${repealed.lawName}」은(는) 폐지된 법령입니다(연혁${d ? `, 최종시행 ${d}` : ""}). 실존했으나 현행 법령이 아님 — 후속·대체 법령 확인 필요`
-        }
-      }
-      if (!fallback) {
-        return `✗ ${inputLabel} — [NOT_FOUND] 법제처 DB에 해당 법령 없음 (법령명 오탈자 또는 존재하지 않는 법령)`
-      }
-      return `⚠ ${inputLabel} — 법제처 검색은 '${fallback.lawName}'(으)로만 매칭됨. 법령명 정확성 재확인 필요`
-    }
-  } catch (e) {
-    return `⚠ ${inputLabel} — 법령 검색 실패: ${e instanceof Error ? e.message : String(e)}`
+  if (resolution.kind === "error") {
+    return `⚠ ${inputLabel} — 법령 검색 실패: ${resolution.message}`
   }
+  if (resolution.kind === "repealed") {
+    const repealed = resolution.law
+    const d = formatYmd(repealed.effectiveDate)
+    return `⌛ ${formatCitationLabel(cite, repealed.lawName)} — [REPEALED] 「${repealed.lawName}」은(는) 폐지된 법령입니다(연혁${d ? `, 최종시행 ${d}` : ""}). 실존했으나 현행 법령이 아님 — 후속·대체 법령 확인 필요`
+  }
+  if (resolution.kind === "renamed") {
+    return verifyRenamed(apiClient, cite, resolution, apiKey)
+  }
+  if (resolution.kind === "not_found") {
+    return `✗ ${inputLabel} — [NOT_FOUND] 법제처 DB에 해당 법령 없음 (법령명 오탈자 또는 존재하지 않는 법령)`
+  }
+  if (resolution.kind === "loose_only") {
+    return `⚠ ${inputLabel} — 법제처 검색은 '${resolution.fallback.lawName}'(으)로만 매칭됨. 법령명 정확성 재확인 필요`
+  }
+  const chosen = resolution.law
 
   if (!chosen?.mst) return `⚠ ${inputLabel} — MST 추출 실패`
 
@@ -305,20 +482,8 @@ async function verifyOne(
     })
 
     if (!found) {
-      // 전체 조회로 범위 힌트
-      let rangeHint = ""
-      try {
-        const fullJson = JSON.parse(await apiClient.getLawText({ mst: chosen.mst, apiKey }))
-        const fullRaw = fullJson?.법령?.조문?.조문단위
-        const fullUnits = toArray<any>(fullRaw)
-        const nums = fullUnits
-          .filter((u: any) => u.조문여부 === "조문" && u.조문번호)
-          .map((u: any) => parseInt(u.조문번호, 10))
-          .filter((n: number) => !isNaN(n))
-        if (nums.length > 0) {
-          rangeHint = ` (존재 범위: 제${Math.min(...nums)}조~제${Math.max(...nums)}조)`
-        }
-      } catch { /* ignore */ }
+      // 전체 조회로 범위 힌트 (같은 법령의 없는 조문이 여럿이어도 전문은 한 번만 받는다)
+      const rangeHint = await memo.rangeHint(chosen.mst)
       return `✗ ${formatCitationLabel(cite, chosen.lawName)} — [NOT_FOUND] 해당 조문 없음${rangeHint}`
     }
 
@@ -359,18 +524,53 @@ async function verifyOne(
   }
 }
 
+/** 옛 법령명 인용 — 그 이름 시절 마지막 버전에서 조문을 확인하고 현행 명칭을 알린다. 번호 체계가 바뀌었을 수 있어 ✓ 대신 ⚠ */
+async function verifyRenamed(
+  apiClient: LawApiClient,
+  cite: ParsedCitation,
+  r: Extract<LawResolution, { kind: "renamed" }>,
+  apiKey?: string,
+): Promise<string> {
+  const label = formatCitationLabel(cite, r.old.lawName)
+  const head = `⚠ ${label} — [RENAMED] 옛 법령명입니다. 제명이 바뀌어 현행은 「${r.current.lawNm}」(법령ID ${r.old.lawId})`
+  if (!r.lastOld) return `${head}. 옛 이름 시절 조문은 확인하지 못했습니다`
+  const when = formatYmd(r.lastOld.efYd)
+  try {
+    const json = JSON.parse(await apiClient.getLawText({ mst: r.lastOld.mst, jo: cite.joCode, efYd: r.lastOld.efYd, apiKey }))
+    const found = toArray<any>(json?.법령?.조문?.조문단위).find((u: any) =>
+      u.조문여부 === "조문" && parseInt(String(u.조문번호 ?? ""), 10) === cite.jo &&
+      (parseInt(String(u.조문가지번호 ?? "0"), 10) || 0) === (cite.joBranch || 0))
+    const status = found
+      ? `옛 이름 시절 마지막 버전(시행 ${when})에 ${cite.displayArticle}${found.조문제목 ? `(${found.조문제목})` : ""} 실존`
+      : `옛 이름 시절 마지막 버전(시행 ${when})에 ${cite.displayArticle} 없음 — 그보다 이전 버전의 조문일 수 있음`
+    return `${head}. ${status}. 조문 번호는 그 뒤 개정으로 바뀌었을 수 있어 현행 인용은 「${r.current.lawNm}」 기준으로 다시 확인`
+  } catch (error) {
+    // 취소만 올린다. 예산 소진은 이 인용만의 실패다 — 올리면 이미 검증한 인용까지 응답 전체가 예산 오류 하나로 바뀌었다
+    // (2026-10-01 감사 재현). 일반 인용의 "조문 조회 실패"와 같은 취급
+    if (getRequestSignal()?.aborted) throw error
+    return `${head}. 옛 이름 시절(시행 ${when}) 조문 조회 실패: ${error instanceof Error ? error.message : String(error)}`
+  }
+}
+
 export async function verifyCitations(
   apiClient: LawApiClient,
   input: VerifyCitationsInput
 ): Promise<{ content: Array<{ type: string, text: string }>, isError?: boolean }> {
   try {
-    const citations = parseCitations(input.text, input.maxCitations ?? 15)
+    throwIfRequestCancelled()
+    const maxCitations = input.maxCitations ?? 15
+    const allCitations = parseCitations(input.text, Infinity)
+    const citations = allCitations.slice(0, maxCitations)
+    const skipped = allCitations.length - citations.length
     // 판례 인용은 법령 인용과 독립 축이다 — 사건번호를 추출조차 않으면 [HALLUCINATION_DETECTED]
     // 배너가 "전체 인용이 검증됐다"로 오독된다(#93).
+    // 같은 법령명은 한 번만 특정하고, 인용은 상한 동시 실행으로 검증한다 (2026-09-23 리뷰 B#3)
+    const memo = createVerifyMemo(apiClient, input.apiKey)
     const [results, cases] = await Promise.all([
-      Promise.all(citations.map((c) => verifyOne(apiClient, c, input.apiKey))),
+      verifyInPriorityOrder(apiClient, citations, memo, input.apiKey),
       verifyCaseCitations(apiClient, input.text, input.apiKey),
     ])
+    throwIfRequestCancelled()
 
     if (citations.length === 0 && cases.total === 0) {
       return {
@@ -393,13 +593,16 @@ export async function verifyCitations(
     const headerMarker = hasHallucination
       ? "[HALLUCINATION_DETECTED] "
       : repealedCount > 0 ? "[REPEALED_REFERENCE] "
-        : (warnCount > 0 || cases.unknown > 0) ? "[PARTIAL_VERIFIED] " : "[VERIFIED] "
+        : (warnCount > 0 || cases.unknown > 0 || skipped > 0 || cases.skipped > 0) ? "[PARTIAL_VERIFIED] " : "[VERIFIED] "
     let output = `${headerMarker}== 인용 검증 결과 ==\n`
-    output += `법령 인용 ${citations.length}건 | ✓ ${okCount} 실존 | ✗ ${failCount} 오류 | ⌛ ${repealedCount} 폐지 | ⚠ ${warnCount} 확인필요\n`
+    output += `법령 인용 ${allCitations.length}건 | ✓ ${okCount} 실존 | ✗ ${failCount} 오류 | ⌛ ${repealedCount} 폐지 | ⚠ ${warnCount} 확인필요${skipped > 0 ? ` | ⊘ ${skipped} 미검증` : ""}\n`
     output += `판례 인용 ${cases.total + cases.skipped}건 | ✓ ${cases.ok} 실존 | ✗ ${cases.fail} 실존불가 | ⚠ ${cases.unknown} 미확인${cases.skipped > 0 ? ` | ⊘ ${cases.skipped} 미검증` : ""}\n\n`
     if (results.length > 0) output += `▶ 법령 인용\n`
     for (const line of results) {
       output += `${line}\n`
+    }
+    if (skipped > 0) {
+      output += `⚠ 법령 인용 ${skipped}건은 확인 상한(${maxCitations}건)을 넘어 검증하지 않았습니다 — 미검증입니다.\n`
     }
     if (cases.lines.length > 0) {
       output += `${results.length > 0 ? "\n" : ""}▶ 판례 인용\n`
@@ -415,7 +618,11 @@ export async function verifyCitations(
       output += `   LLM이 지어낸 인용일 가능성이 높습니다. 원문을 수정하거나 사용자에게 '인용 오류'를 명시 보고하세요.\n`
       output += `   절대로 "검증 완료"로 답변하지 마세요.\n`
     }
-    if (warnCount > 0) {
+    const renamedCount = results.filter((r) => r.includes("[RENAMED]")).length
+    if (renamedCount > 0) {
+      output += `\n⟳ [RENAMED_REFERENCE] ${renamedCount}건은 제명이 바뀐 법령의 옛 이름 인용입니다. 폐지가 아니라 같은 법령이 이름을 바꿨으니 현행 명칭으로 고치고, 조문 번호는 legal_analysis(mode="applicable_law", lawName, date)로 시점별로 확인하세요.\n`
+    }
+    if (warnCount > renamedCount) {
       output += `\n💡 ⚠ 항목은 법령명 불명확/부분 매칭/API 일시 실패 등. 법령명을 명시하거나 재시도하세요.\n`
     }
     if (cases.unknown > 0) {

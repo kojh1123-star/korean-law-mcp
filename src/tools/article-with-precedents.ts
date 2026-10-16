@@ -9,6 +9,9 @@ import { renderPrecedentSearchResult } from "./precedents.js"
 import { searchPrecedentsStructured } from "./precedent-search-core.js"
 import { truncateResponse } from "../lib/schemas.js"
 import { formatToolError } from "../lib/errors.js"
+import { getRequestSignal } from "../lib/session-state.js"
+import { maskSensitiveUrl } from "../lib/fetch-with-retry.js"
+import { classifyArticleRefs, parseArticleAnchor } from "../lib/article-anchor.js"
 
 export const GetArticleWithPrecedentsSchema = z.object({
   mst: z.string().optional().describe("법령일련번호 (search_law에서 획득)"),
@@ -51,7 +54,8 @@ export async function getArticleWithPrecedents(
 
     const lawName = lawNameMatch[1].trim()
     // 3. 관련 판례 검색
-    const precedentQuery = `${lawName} ${input.jo}`
+    const anchor = parseArticleAnchor(input.jo, lawName)
+    const precedentQuery = `${lawName} ${anchor?.display || input.jo}`
 
     try {
       const precedentResult = await searchPrecedentsStructured(apiClient, {
@@ -62,6 +66,12 @@ export async function getArticleWithPrecedents(
       }, {
         fallbackPolicy: "none",
       })
+      const originalTotal = precedentResult.totalCount
+      precedentResult.hits = precedentResult.hits.filter(hit => {
+        const verdict = anchor ? classifyArticleRefs(hit.title, anchor) : "silent"
+        return verdict !== "mismatch" && verdict !== "law-mismatch"
+      })
+      precedentResult.totalCount = precedentResult.hits.length
 
       if (precedentResult.hits.length > 0) {
         const precedentText = renderPrecedentSearchResult(precedentResult)
@@ -69,15 +79,24 @@ export async function getArticleWithPrecedents(
         // 판례 결과가 있으면 추가
         if (precedentText && !precedentText.includes("검색 결과가 없습니다")) {
           resultText += `\n${"=".repeat(60)}\n`
-          resultText += `\n관련 판례 (상위 5건)\n\n`
+          resultText += `\n관련 판례 (조회 표본 ${precedentResult.hits.length}건; 원검색 총 ${originalTotal}건)\n\n`
           resultText += precedentText
         } else {
           resultText += `\n\n관련 판례: 검색 결과 없음`
         }
+      } else {
+        // 0건과 조회 실패와 includePrecedents=false가 같은 출력(판례 절 없음)이라 소비자가 가를 수 없었다.
+        // 상태를 한 줄로 밝힌다 (2026-09-23 리뷰 D10).
+        resultText += originalTotal > 0
+          ? `\n\n관련 판례: 원검색 총 ${originalTotal}건 중 조회 표본에서 조문·법령 경계 확인 결과 0건. 표본 밖의 관련 판례 존재 여부는 확인하지 못했습니다.`
+          : `\n\n관련 판례: '${precedentQuery}' 검색 결과 0건. 이 검색어 조합의 결과일 뿐 관련 판례가 없다는 확인은 아닙니다.`
       }
     } catch (error) {
-      // 판례 검색 실패는 무시하고 조문 내용만 반환
-      // 판례 검색 실패는 무시 (조문 내용만 반환)
+      // 판례 검색 실패는 조문을 버리지 않되, 실패 사실은 밝힌다. 침묵하면 "관련 판례 없음"으로 읽힌다 (리뷰 D10).
+      // 예산 소진도 여기서 실패로 적고 이미 받은 조문은 돌려준다. 요청 취소만 전파한다(독립 리뷰).
+      if (getRequestSignal()?.aborted) throw error
+      const reason = maskSensitiveUrl(error instanceof Error ? error.message : String(error))
+      resultText += `\n\n관련 판례: 조회 실패 (${reason}). 조문 본문만 반환합니다. 관련 판례가 없다는 뜻이 아닙니다.`
     }
 
     return {

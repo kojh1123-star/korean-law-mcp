@@ -1,5 +1,5 @@
 /**
- * Unified Decision Tools — 16개 도메인의 search/get을 2개 도구로 통합
+ * Unified Decision Tools — 21개 도메인의 search/get을 2개 도구로 통합
  *
  * 기존 34개 도구 → search_decisions + get_decision_text
  * 컨텍스트 절감: ~51KB → ~3KB
@@ -19,6 +19,7 @@ import { searchTaxTribunalDecisions, getTaxTribunalDecisionText } from "./tax-tr
 import {
   searchCustomsInterpretations, getCustomsInterpretationText,
   searchNtsInterpretations, getNtsInterpretationText,
+  searchMoelInterpretations, getMoelInterpretationText,
 } from "./customs-interpretations.js"
 import { searchConstitutionalDecisions, getConstitutionalDecisionText } from "./constitutional-decisions.js"
 import { searchAdminAppeals, getAdminAppealText } from "./admin-appeals.js"
@@ -27,6 +28,8 @@ import {
   searchPipcDecisions, getPipcDecisionText,
   searchNlrcDecisions, getNlrcDecisionText,
   searchAcrDecisions, getAcrDecisionText,
+  searchIaciacDecisions, getIaciacDecisionText,
+  searchEiacDecisions, getEiacDecisionText,
 } from "./committee-decisions.js"
 import {
   searchAppealReviewDecisions, getAppealReviewDecisionText,
@@ -43,8 +46,8 @@ import { fetchPrecedentEvidence, validatePrecedentSearchResult } from "./precede
 // ========================================
 
 const DOMAINS = [
-  "precedent", "interpretation", "tax_tribunal", "customs", "nts",
-  "constitutional", "admin_appeal", "ftc", "pipc", "nlrc", "acr",
+  "precedent", "interpretation", "tax_tribunal", "customs", "nts", "moel",
+  "constitutional", "admin_appeal", "ftc", "pipc", "nlrc", "iaciac", "eiac", "acr",
   "appeal_review", "acr_special",
   "school", "public_corp", "public_inst",
   "treaty", "english_law",
@@ -58,11 +61,14 @@ const DOMAIN_LABELS: Record<Domain, string> = {
   tax_tribunal: "조세심판원 재결례",
   customs: "관세청 법령해석",
   nts: "국세청 법령해석",
+  moel: "고용노동부 법령해석",
   constitutional: "헌재 결정례",
   admin_appeal: "행정심판례",
   ftc: "공정위 결정문",
   pipc: "개인정보위 결정문",
   nlrc: "노동위 결정문",
+  iaciac: "산재보험재심사 결정문",
+  eiac: "고용보험심사 결정문",
   acr: "권익위 결정문",
   appeal_review: "소청심사 재결례",
   acr_special: "권익위 특별행정심판",
@@ -80,11 +86,14 @@ const SEARCH_HANDLERS: Record<Domain, (api: LawApiClient, args: any) => Promise<
   tax_tribunal: searchTaxTribunalDecisions,
   customs: searchCustomsInterpretations,
   nts: searchNtsInterpretations,
+  moel: searchMoelInterpretations,
   constitutional: searchConstitutionalDecisions,
   admin_appeal: searchAdminAppeals,
   ftc: searchFtcDecisions,
   pipc: searchPipcDecisions,
   nlrc: searchNlrcDecisions,
+  iaciac: searchIaciacDecisions,
+  eiac: searchEiacDecisions,
   acr: searchAcrDecisions,
   appeal_review: searchAppealReviewDecisions,
   acr_special: searchAcrSpecialAppeals,
@@ -99,7 +108,11 @@ const SEARCH_HANDLERS: Record<Domain, (api: LawApiClient, args: any) => Promise<
  * 이미 compactBody가 적용된 도메인 — get_decision_text 후처리 축약 skip
  * (precedents.ts, constitutional-decisions.ts, admin-appeals.ts에서 자체 적용)
  */
-const ALREADY_COMPACTED: ReadonlySet<Domain> = new Set(["precedent", "constitutional", "admin_appeal"])
+// interpretation: 해석례는 "이유"가 본문의 핵심이다. 라벨을 "관계법령"에서 "이유"로 바로잡자
+// compactLongSections 가 그 섹션을 기본으로 절반 가까이 잘랐다(실측 ID 338575: 4,608자 → 2,279자).
+// 라벨 정정 전처럼 축약하지 않는다(2026-09-23 독립 리뷰).
+// moel: 고용노동부 질의회시는 회답·이유가 곧 해석 본문이라 해석례와 같은 이유로 축약하지 않는다.
+const ALREADY_COMPACTED: ReadonlySet<Domain> = new Set(["precedent", "constitutional", "admin_appeal", "interpretation", "moel"])
 
 // Get handler dispatch table
 const GET_HANDLERS: Record<Domain, (api: LawApiClient, args: any) => Promise<LooseToolResponse>> = {
@@ -108,11 +121,14 @@ const GET_HANDLERS: Record<Domain, (api: LawApiClient, args: any) => Promise<Loo
   tax_tribunal: getTaxTribunalDecisionText,
   customs: getCustomsInterpretationText,
   nts: getNtsInterpretationText,
+  moel: getMoelInterpretationText,
   constitutional: getConstitutionalDecisionText,
   admin_appeal: getAdminAppealText,
   ftc: getFtcDecisionText,
   pipc: getPipcDecisionText,
   nlrc: getNlrcDecisionText,
+  iaciac: getIaciacDecisionText,
+  eiac: getEiacDecisionText,
   acr: getAcrDecisionText,
   appeal_review: getAppealReviewDecisionText,
   acr_special: getAcrSpecialAppealText,
@@ -136,7 +152,7 @@ export const SearchDecisionsSchema = z.object({
   page: z.number().min(1).default(1).optional().describe("페이지 (기본1)"),
   sort: z.string().optional().describe("정렬: lasc/ldes/dasc/ddes/nasc/ndes"),
   options: z.record(z.string(), z.unknown()).optional().describe(
-    "도메인별 옵션. prec:{court,caseNumber,fromDate,toDate} tax_tribunal:{cls,gana,dpaYd,rslYd} customs:{inq,rpl,gana,explYd} constitutional:{caseNumber} interpretation:{fromDate,toDate} treaty:{cls,natCd,eftYd,concYd}"
+    "도메인별 옵션. prec:{court,caseNumber,fromDate,toDate,search(1=판례명 기본·2=본문·\"both\"=판례명+본문)} tax_tribunal:{cls,gana,dpaYd,rslYd} customs:{inq,rpl,gana,explYd} moel:{search(1=안건명 기본·2=본문),explYd} constitutional:{caseNumber} interpretation:{fromDate,toDate} treaty:{cls,natCd,eftYd,concYd}"
   ),
   apiKey: z.string().optional(),
 })
@@ -262,7 +278,7 @@ export async function getDecisionText(
 
     // 도메인별 추가 옵션 병합 (핵심 필드 덮어쓰기 방지)
     if (input.options) {
-      const reserved = new Set(["id", "apiKey", "domain", "full"])
+      const reserved = new Set(["id", "lawId", "apiKey", "domain", "full"])
       for (const [k, v] of Object.entries(input.options)) {
         if (!reserved.has(k)) args[k] = v
       }

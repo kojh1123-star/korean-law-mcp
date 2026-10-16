@@ -3,8 +3,18 @@ import { parsePrecedentXML, type PrecedentItem } from "../lib/xml-parser.js"
 import { buildCompactLegalQueries } from "./compact-query-planner.js"
 import type { AiLawArticleSignal } from "./life-law.js"
 import type { SearchPrecedentsInput } from "./precedents.js"
+import { rethrowIfFatal } from "../lib/fatal-errors.js"
+import { extractCaseNumbers, fieldHasExactCase } from "../lib/case-citation.js"
 
 export type PrecedentSearchMode = 1 | 2
+export type PrecedentSearchScope = PrecedentSearchMode | "both"
+
+/** search 인자 정규화. search_decisions 의 options 는 스키마 검증 없이 넘어와 "2" 같은 문자열도 온다. */
+export function precedentSearchScope(args: SearchPrecedentsInput): PrecedentSearchScope {
+  const value = String(args.search ?? 1)
+  if (value === "both") return "both"
+  return value === "2" ? 2 : 1
+}
 
 export interface PrecedentSearchAttempt {
   query?: string
@@ -31,7 +41,6 @@ export interface PrecedentHit {
   court?: string
   date?: string
   decisionType?: string
-  link?: string
   sourceQuery?: string
   semanticAnchor?: string
   searchMode: PrecedentSearchMode
@@ -118,7 +127,8 @@ function toHit(
     court: item.법원명 || undefined,
     date: cleanDate(item.선고일자) || item.선고일자 || undefined,
     decisionType: item.판결유형 || undefined,
-    link: item.판례상세링크 || undefined,
+    // 판례상세링크는 싣지 않는다 (2026-09-23 리뷰 C5). 업스트림 링크는 요청 키(OC=)를 박은 채
+    // &amp; 로 인코딩돼 와서(실측) 찍으면 서버 폴백 키가 새고 링크로도 못 쓴다. 후속 조회는 id 로 한다.
     sourceQuery,
     semanticAnchor,
     searchMode,
@@ -159,7 +169,10 @@ async function runPrecedentSearchOnce(
     apiKey: args.apiKey,
   })
   const parsed = parsePrecedentXML(xmlText)
-  const rawHits = parsed.items.map(item => toHit(item, input.query, input.search, input.semanticAnchor))
+  const items = input.caseNumber
+    ? parsed.items.filter(item => fieldHasExactCase(item.사건번호 || "", input.caseNumber!))
+    : parsed.items
+  const rawHits = items.map(item => toHit(item, input.query, input.search, input.semanticAnchor))
   const hits = input.relaxDateRange || !hasDateRange(args)
     ? markDateRelaxed(rawHits, args)
     : rawHits.filter(hit => isDateInRange(hit.date, args.fromDate, args.toDate))
@@ -171,7 +184,7 @@ async function runPrecedentSearchOnce(
     fromDate: args.fromDate,
     toDate: args.toDate,
     reason: input.reason,
-    totalCount: parsed.totalCnt,
+    totalCount: input.caseNumber ? items.length : parsed.totalCnt,
     hitCount: hits.length,
     success: hits.length > 0,
     outOfRequestedDateRange: input.relaxDateRange ? hits.some(hit => hit.outOfRequestedDateRange) : undefined,
@@ -188,18 +201,28 @@ async function runPrecedentSearchOnce(
   }
 }
 
+function exactCaseNumber(args: SearchPrecedentsInput): string | undefined {
+  if (args.caseNumber) return args.caseNumber.replace(/\s/g, "")
+  if (precedentSearchScope(args) === 2) return undefined
+  const query = (args.query || "").replace(/\s/g, "")
+  const [caseNo] = extractCaseNumbers(query)
+  return caseNo === query ? caseNo : undefined
+}
+
 function firstAttempt(args: SearchPrecedentsInput): SearchOnceInput {
-  if (args.caseNumber) {
+  const caseNumber = exactCaseNumber(args)
+  const search = precedentSearchScope(args) === 2 ? 2 : 1
+  if (caseNumber) {
     return {
-      caseNumber: args.caseNumber,
-      search: (args.search || 1) as PrecedentSearchMode,
+      caseNumber,
+      search,
       reason: "case_number",
     }
   }
 
   return {
     query: args.query,
-    search: (args.search || 1) as PrecedentSearchMode,
+    search,
     reason: "original_query",
   }
 }
@@ -209,9 +232,9 @@ function fallbackInputs(args: SearchPrecedentsInput, context: PrecedentSearchCon
   const inputs: SearchOnceInput[] = []
   const fallbackPolicy = context.fallbackPolicy ?? "full"
 
-  if (fallbackPolicy === "none") return inputs
+  if (fallbackPolicy === "none" || exactCaseNumber(args)) return inputs
 
-  if (args.query && (args.search || 1) === 1) {
+  if (args.query && precedentSearchScope(args) !== 2) {
     inputs.push({
       query: args.query,
       search: 2,
@@ -278,12 +301,13 @@ export async function searchPrecedentsStructured(
     attempts.push(result.attempt)
     page = result.page
 
-    if (result.attempt.success && result.attempt.requiresResultValidation && context.validateResult) {
+    const validationHits = result.hits.length > 0 ? result.hits : hasDateRange(args) ? result.rawHits : []
+    if (validationHits.length > 0 && result.attempt.requiresResultValidation && context.validateResult) {
       try {
         const accepted = await context.validateResult({
           originalArgs: args,
           attempt: result.attempt,
-          hits: result.hits,
+          hits: validationHits,
         })
         if (!accepted) {
           result.attempt.success = false
@@ -293,6 +317,7 @@ export async function searchPrecedentsStructured(
           result.hits = []
         }
       } catch (error) {
+        rethrowIfFatal(error)
         result.attempt.success = false
         result.attempt.hitCount = 0
         result.attempt.validationFailed = true
@@ -314,6 +339,25 @@ export async function searchPrecedentsStructured(
   }
 
   const initial = await run(firstAttempt(args))
+
+  // search="both" (#167): 제목 적중 몇 건으로 끝내지 않고 본문검색까지 합친다. 사건번호 exact 조회는 제외.
+  if (initial && args.query && precedentSearchScope(args) === "both" && initial.attempt.reason === "original_query") {
+    const body = await run({ query: args.query, search: 2, reason: "body_search" })
+    const titleIds = new Set(initial.hits.map(hit => hit.id))
+    const hits = [...initial.hits, ...(body?.hits ?? []).filter(hit => !titleIds.has(hit.id))]
+    if (hits.length > 0) {
+      return {
+        originalArgs: args,
+        totalCount: hasDateRange(args) ? hits.length : Math.max(initial.attempt.totalCount, body?.attempt.totalCount ?? 0),
+        page,
+        hits,
+        attempts,
+        fallbackUsed: false,
+        successfulAttempt: initial.attempt.success ? initial.attempt : body?.attempt,
+      }
+    }
+  }
+
   if (initial?.attempt.success) {
     return {
       originalArgs: args,
