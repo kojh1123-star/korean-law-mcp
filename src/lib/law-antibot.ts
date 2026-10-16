@@ -13,7 +13,7 @@
  * 원본 재시도 성공" 경로는 제한적이다. 주 경로는 토큰 URL 직접 파싱이다.
  */
 
-import { readBodyPrefix } from "./response-body.js"
+import { readBodyPrefix, UpstreamBodyStallError } from "./response-body.js"
 import { ExecutionLimitError } from "./execution-limits.js"
 import { combineAbortSignals, getRequestSignal, requestContext, throwIfRequestCancelled } from "./session-state.js"
 
@@ -84,7 +84,7 @@ export async function followLawAntibot(
   let hopped = false
 
   const finishWith = async (replacement: Response): Promise<Response> => {
-    if (replacement !== root) await root.body?.cancel().catch(() => {})
+    if (replacement !== root) void root.body?.cancel().catch(() => {})
     return replacement
   }
 
@@ -96,13 +96,13 @@ export async function followLawAntibot(
       // 청구하므로 여기서 세면 이중 계상). 마커가 잘려 못 읽으면 원본 진행이다.
       ;({ text } = await readBodyPrefix(inspection, ANTIBOT_PROBE_BYTES))
     } catch (error) {
-      if (error instanceof ExecutionLimitError || getRequestSignal()?.aborted) {
-        // `clone()` tees the body; cancelling one branch can wait for the
-        // other. Release both concurrently on terminal request errors.
-        await Promise.allSettled([
-          inspection.body?.cancel(),
-          current.body?.cancel(),
-        ])
+      // 본문 정지(UpstreamBodyStallError)도 여기서 끝낸다. "안티봇 아님, 계속"으로 넘기면 뒤의
+      // classifyOkBody 가 같은 정지를 20초 더 기다려 시도당 40초를 썼다(2026-09-23 독립 리뷰, 재현 80초).
+      if (error instanceof ExecutionLimitError || error instanceof UpstreamBodyStallError || getRequestSignal()?.aborted) {
+        // Discard both tee branches, but cleanup must not delay cancellation
+        // if the underlying stream's cancel promise never settles.
+        void inspection.body?.cancel().catch(() => {})
+        void current.body?.cancel().catch(() => {})
         throw error
       }
       // Keep `current` readable for the caller. Cancellation of the discarded
@@ -142,7 +142,7 @@ export async function followLawAntibot(
     } catch (error) {
       // An intermediate token response is no longer useful after its next
       // hop fails. Keep only `root` intact for fetchWithRetry's fallback.
-      if (current !== root) await current.body?.cancel().catch(() => {})
+      if (current !== root) void current.body?.cancel().catch(() => {})
       throw error
     }
     hopped = true
@@ -151,12 +151,12 @@ export async function followLawAntibot(
     if (next.status === 404) {
       try {
         const fallback = await fetchOnce(originalUrl, headers, timeout)
-        await next.body?.cancel().catch(() => {})
-        if (current !== root) await current.body?.cancel().catch(() => {})
+        void next.body?.cancel().catch(() => {})
+        if (current !== root) void current.body?.cancel().catch(() => {})
         return await finishWith(fallback)
       } catch (error) {
-        await next.body?.cancel().catch(() => {})
-        if (current !== root) await current.body?.cancel().catch(() => {})
+        void next.body?.cancel().catch(() => {})
+        if (current !== root) void current.body?.cancel().catch(() => {})
         throw error
       }
     }
@@ -164,7 +164,7 @@ export async function followLawAntibot(
     // A successful hop replaces only the previous intermediate. The root is
     // retained until a final usable response exists, so outer fallback never
     // receives a cancelled body.
-    if (current !== root) await current.body?.cancel().catch(() => {})
+    if (current !== root) void current.body?.cancel().catch(() => {})
     current = next
   }
 

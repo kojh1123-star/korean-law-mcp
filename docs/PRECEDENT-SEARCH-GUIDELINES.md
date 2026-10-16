@@ -20,7 +20,7 @@
 - `src/tools/precedent-search-core.ts`
   - `searchPrecedentsStructured()`가 판례 목록 검색의 공통 진입점이다.
   - 반환값은 `StructuredPrecedentSearchResult`이며 `hits`, `attempts`, `fallbackUsed`, `successfulAttempt`를 포함한다.
-  - 1차 검색은 명시 사건번호가 있으면 `caseNumber`, 아니면 원문 `query`로 수행한다.
+  - 1차 검색은 명시 사건번호 또는 사건번호만인 `query`가 있으면 정확 사건번호로 수행한다. 정확 검색은 이웃 번호를 제외하고 실패 시 다른 판례로 대체하지 않는다. 명시적 `search=2`의 query는 역인용 본문검색을 유지한다.
   - 기본 fallback 정책은 `"full"`이다. 제목 검색 실패 시 본문검색(`search=2`)을 먼저 시도하고, 이후 compact query 후보를 시도한다.
   - `fallbackPolicy: "body"`는 본문검색까지만 허용한다.
   - `fallbackPolicy: "none"`은 보정 검색을 하지 않는다.
@@ -40,6 +40,7 @@
   - 상세조회 기본 개수는 2건이고, 최대 5건으로 제한한다.
 
 - `src/tools/precedents.ts`
+  - 파싱된 판례 원문을 전용 20건 `precedentCache`에 24시간 보관한다. full/축약 렌더와 `cite_check`가 공유한다.
   - `searchPrecedents()`는 구조화 core를 호출한 뒤 `renderPrecedentSearchResult()`로 기존 텍스트 형식으로 렌더링한다.
   - 결과가 없으면 `[NOT_FOUND]`와 재시도 힌트를 포함하고 `isError`를 설정한다.
   - 결과가 있으면 `[id] 제목`, 사건번호, 법원, 선고일, 판결유형, 링크를 유지한다.
@@ -51,7 +52,7 @@
 
 - `src/tool-registry.ts`
 - `search_precedents`와 `get_precedent_text`는 별도 도구로 등록된다.
-- v3 exposed profile에서는 직접 노출 도구가 제한된다. 현재 직접 노출 도구는 `V3_EXPOSED`에 있는 17개이며, `search_precedents`와 `get_precedent_text`는 직접 노출되지 않는다.
+- v3 exposed profile에서는 직접 노출 도구가 제한된다. 현재 직접 노출 도구는 `V3_EXPOSED`에 있는 10개이며, `search_precedents`와 `get_precedent_text`는 직접 노출되지 않는다.
 - `execute_tool`, `search_decisions`, `get_decision_text`를 통한 우회 호출도 고려한다.
 
 ### 직접 판례 검색과 본문조회
@@ -109,6 +110,9 @@
 - `options.includeText`가 `true` 또는 `"true"`이면 `searchPrecedentDecisionsWithText()` 경로로 들어간다.
 - `includeText` 경로는 구조화 판례 검색 결과 뒤에 `fetchPrecedentEvidence()` 상세 증거를 붙인다.
 - `options.detailLimit`은 숫자 또는 숫자 문자열을 받을 수 있고, 실제 상세조회 개수는 `precedent-evidence`의 상한을 따른다.
+- `options.search`는 검색범위다: `1`=판례명(기본), `2`=본문, `"both"`=판례명+본문(#167). options 는 스키마 검증 없이 넘어오므로 core 의 `precedentSearchScope()`가 `"2"` 같은 문자열까지 정규화한다.
+- `"both"`는 제목검색과 본문검색을 각각 한 번씩(각 `display`건) 돌려 판례ID로 중복을 빼고 제목 적중을 앞에 둔다. 렌더는 범위별 건수와 건마다 `적중: 제목검색|본문검색`을 보인다. 사건번호만 넣은 exact 조회는 `"both"`여도 한 번으로 끝난다.
+- 기본(제목검색)이 보정 없이 3건 이하로 끝나면 렌더 끝에 `options={search:"both"}` 재검색 안내를 붙인다. 제목에 우연히 맞은 몇 건으로 법리 탐색이 끝나는 것을 막는 신호다.
 - `get_decision_text`는 여전히 `domain="precedent"`와 검색 결과 ID를 받아 `getPrecedentText()`로 상세 본문을 조회한다.
 
 ### 조문 기반 보조 도구

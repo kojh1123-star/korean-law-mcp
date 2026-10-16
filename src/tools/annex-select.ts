@@ -32,7 +32,12 @@ export interface AnnexItem {
  * "여권법 시행규칙" → "여권법", "관세법 시행령" → "관세법"
  */
 export function extractParentLawName(lawName: string): string | null {
-  const cleaned = lawName.replace(/\s*(시행규칙|시행령)$/, '')
+  // 2026-09-23 리뷰 C2: 종전 `\s*(시행규칙|시행령)$` 는 공백 덩어리의 시작 위치마다 끝까지 훑어
+  // 제곱이었다(공백 10만 자 13.4초). 접미어만 끝에서 찾고 그 앞 공백은 trimEnd 로 걷는다.
+  // `\s` 와 trimEnd 는 같은 공백 집합이라 결과는 같다.
+  const suffix = /(?:시행규칙|시행령)$/.exec(lawName)
+  if (!suffix) return null
+  const cleaned = lawName.slice(0, suffix.index).trimEnd()
   return cleaned !== lawName ? cleaned : null
 }
 
@@ -70,7 +75,11 @@ export function findMatchingAnnex(
     // 모델이 "별표1" 등 임의 번호로 불러도 매칭 0건 → NOT_FOUND로 새는 대신 유일 별표를 반환.
     // 단, 가지번호(1의2) 요청은 폴백 금지 — 유일 항목이 본번(별표 1)이어도 다른 별표라서,
     // 위 buildSelectorCandidates가 막은 "별표 1 무음 오선택"이 여기로 재개방되면 안 된다.
-    if (annexList.length === 1 && parseAnnexNumber(annexSelector)?.sub == null) {
+    const sole = annexList[0]
+    const unnumbered = sole && !String(sole.별표번호 || "").trim()
+      && !String(sole.별표명 || "").match(ANNEX_NOTATION_RE)?.some(label => parseAnnexNumber(label))
+    const requestedSub = fromAnnexCode(annexSelector.trim())?.sub ?? parseAnnexNumber(annexSelector)?.sub
+    if (annexList.length === 1 && unnumbered && !requestedSub) {
       return annexList[0]
     }
     return undefined
@@ -191,7 +200,7 @@ function titleMatchesAnnexNumber(title: string, annexNumber: string): boolean {
   // 꼬리의 `서식`까지 받는 이유도 그 표기다(번호가 낱말 사이에 낀다).
   const patterns = [
     new RegExp(`\\[\\s*(?:${kw})\\s*(?:제)?\\s*${numberSrc}\\s*(?:호)?\\s*(?:서식)?\\s*\\]`),
-    new RegExp(`(?:${kw})\\s*제?\\s*${numberSrc}\\s*(?:호)?`),
+    new RegExp(`(?:${kw})\\s*제?\\s*${numberSrc}(?!\\d|\\s*(?:호\\s*)?의)\\s*(?:호)?`),
   ]
 
   if (patterns.some((pattern) => pattern.test(title))) {
@@ -200,7 +209,7 @@ function titleMatchesAnnexNumber(title: string, annexNumber: string): boolean {
 
   // 묶음 별표 범위 매칭: "[별표1~5]", "[별표 1 ~ 5]" 등
   const num = Number.parseInt(annexNumber, 10)
-  if (!Number.isNaN(num)) {
+  if (!Number.isNaN(num) && parsed?.sub == null) {
     const rangePattern = /별표\s*(\d+)\s*[~\-]\s*(\d+)/g
     let match: RegExpExecArray | null
     while ((match = rangePattern.exec(title)) !== null) {
@@ -312,7 +321,10 @@ export function filterByRelatedLawName(annexList: AnnexItem[], queryName: string
 export function annexQueryKeywords(query?: string): string[] {
   if (!query) return []
   // 표기 문법은 annex-notation 단일 원본이 쥔다 — 여기에 사본을 두면 어휘가 또 갈린다
+  // 2026-09-23 리뷰 C2: ANNEX_NOTATION_RE 의 선두 `\s*` 는 공백 덩어리에서 제곱이었다(10만 자 6.3초).
+  // 공백을 먼저 한 칸으로 접는다. 토큰은 어차피 공백으로 나누므로 결과는 같다.
   return query
+    .replace(/\s+/g, " ")
     .replace(ANNEX_NOTATION_RE, " ")
     .split(/[\s,·ㆍ]+/)
     .map((t) => t.trim())

@@ -5,7 +5,8 @@
 
 import { z } from "zod"
 import { LawApiClient } from "./api-client.js"
-import { allTools } from "../tool-registry.js"
+import { allTools, findOversizedArg } from "../tool-registry.js"
+import { maskToolText } from "./tool-output.js"
 import { routeQuery, type RouteResult } from "./query-router.js"
 import { SEARCH_DETAIL_CHAINS } from "./tool-chain-config.js"
 import type { ToolResponse } from "./types.js"
@@ -44,15 +45,18 @@ export async function executeTool(
   }
 
   try {
+    const oversized = findOversizedArg(params)
+    if (oversized) throw new Error(`인자가 너무 깁니다: ${oversized}`)
     const parsed = tool.schema.parse(params)
-    return await tool.handler(apiClient, parsed) as ToolResponse
+    const result = await tool.handler(apiClient, parsed) as ToolResponse
+    return { ...result, content: result.content.map(c => ({ ...c, text: maskToolText(c.text, params) })) }
   } catch (error) {
     // Zod 검증 실패 등 모든 예외를 ToolResponse로 감싸서 반환
     const msg = error instanceof z.ZodError
       ? error.issues.map(i => `${i.path.join(".")}: ${i.message}`).join("; ")
       : (error instanceof Error ? error.message : String(error))
     return {
-      content: [{ type: "text", text: `오류 [${toolName}]: ${msg}` }],
+      content: [{ type: "text", text: maskToolText(`오류 [${toolName}]: ${msg}`, params) }],
       isError: true,
     }
   }
@@ -180,6 +184,7 @@ export async function executeNaturalQueryJson(
     applyDateRange(route)
 
     const result = await executeTool(apiClient, route.tool, route.params)
+    let isError = Boolean(result.isError)
 
     let pipelineResult: string | undefined
     if (route.pipeline && route.pipeline.length > 0 && !result.isError) {
@@ -191,6 +196,7 @@ export async function executeNaturalQueryJson(
         for (const step of route.pipeline) {
           const pResult = await executeTool(apiClient, step.tool, { ...step.params, ...pipeId })
           outputs.push(pResult.content.map(c => c.text).join("\n"))
+          isError ||= Boolean(pResult.isError)
         }
         pipelineResult = outputs.join("\n\n")
       }
@@ -201,8 +207,9 @@ export async function executeNaturalQueryJson(
       route: { tool: route.tool, reason: route.reason, params: route.params },
       result: result.content.map(c => c.text).join("\n"),
       pipelineResult,
-      isError: result.isError || false,
+      isError,
     }, null, 2))
+    if (isError) process.exitCode = 1
   } catch (error) {
     console.log(JSON.stringify({
       query,
