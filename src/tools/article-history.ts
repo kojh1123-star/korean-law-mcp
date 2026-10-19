@@ -8,6 +8,7 @@ import type { LawApiClient } from "../lib/api-client.js"
 import { truncateResponse } from "../lib/schemas.js"
 import { formatToolError } from "../lib/errors.js"
 import { normalizeAliasKey, resolveLawAlias } from "../lib/search-normalizer.js"
+import { buildJO } from "../lib/law-parser.js"
 
 /**
  * JO 코드를 읽기 쉬운 형식으로 변환
@@ -59,12 +60,10 @@ export async function getArticleHistory(
       const nodes = doc.getElementsByTagName("law")
       const queryKey = normalizeAliasKey(input.lawName)
       const canonicalKey = normalizeAliasKey(resolveLawAlias(input.lawName).canonical)
-      let firstId = ""
       let exactId = ""
       for (let i = 0; i < nodes.length; i++) {
         const id = nodes[i].getElementsByTagName("법령ID")[0]?.textContent || ""
         if (!id) continue
-        if (!firstId) firstId = id
         const nameKey = normalizeAliasKey(nodes[i].getElementsByTagName("법령명한글")[0]?.textContent || "")
         const abbrKey = normalizeAliasKey(nodes[i].getElementsByTagName("법령약칭명")[0]?.textContent || "")
         if (nameKey === queryKey || nameKey === canonicalKey || (abbrKey && (abbrKey === queryKey || abbrKey === canonicalKey))) {
@@ -72,12 +71,12 @@ export async function getArticleHistory(
           break
         }
       }
-      lawId = exactId || firstId
+      lawId = exactId
       if (!lawId) {
         return {
           content: [{
             type: "text",
-            text: `[NOT_FOUND] 법령 '${input.lawName}'을(를) 찾을 수 없습니다.\n⚠️ LLM은 개정 이력을 추측하지 마세요. 법령명을 확인하거나 search_law로 먼저 검색하세요.`
+            text: `[NOT_FOUND] 법령 '${input.lawName}'과(와) 정확히 일치하는 법령을 찾을 수 없습니다.\n⚠️ LLM은 개정 이력을 추측하지 마세요. search_law로 법령을 확인하고 법령ID(lawId)로 다시 조회하세요.`
           }],
           isError: true
         }
@@ -88,13 +87,31 @@ export async function getArticleHistory(
     const noDateFilter = !input.regDt && !input.fromRegDt && !input.toRegDt
     const dateDefaults = noDateFilter ? { fromRegDt: "19480101", toRegDt: "20991231" } : {}
 
-    const xmlText = await apiClient.getArticleHistory({ ...input, ...dateDefaults, lawId, apiKey: input.apiKey })
+    // 업스트림 JO는 6자리 코드만 알아듣는다. 스키마 예시 그대로 '제38조'를 보내면 조문 필터가 안 걸려
+    // 법령 버전만 오고 조문 기록은 0건이라, 실존 개정 이력에 거짓 NOT_FOUND가 났다
+    // (2026-09-23 리뷰 D5, 실측 관세법: JO=제38조 → jo 0건, JO=003800 → 6건). 이미 코드면 그대로 둔다:
+    // buildJO("003800")은 3800조로 읽어 "380000"이 된다.
+    const jo = input.jo && !/^\d{6}$/.test(input.jo) ? buildJO(input.jo) : input.jo
 
+    // 응답 행은 "법령 버전"이고, 조문이 실제로 바뀐 버전에만 <jo> 가 붙는다. 조문을 지정하면 총계가 곧 버전 수라
+    // 한 쪽(기본 20행)만 받으면 뒤쪽 버전의 변경이 통째로 빠졌다 — 소방시설법 시행령 제11조: "총 58건"에 2004 제정 1건만
+    // 보이고 2012·2015·2016·2022 변경이 2~3쪽에 묻혔다(2026-09-28). 조문 지정 시 100행 단위로 전 버전을 받는다.
+    const wholeJo = Boolean(jo) && (input.page ?? 1) === 1
+    const fetchPage = (page?: number) => apiClient.getArticleHistory({
+      ...input, ...dateDefaults, lawId, jo, apiKey: input.apiKey,
+      ...(wholeJo ? { display: 100, page } : {}),
+    })
     const parser = new DOMParser()
-    const doc = parser.parseFromString(xmlText, "text/xml")
-
-    const totalCnt = doc.getElementsByTagName("totalCnt")[0]?.textContent || "0"
-    const laws = doc.getElementsByTagName("law")
+    const first = parser.parseFromString(await fetchPage(), "text/xml")
+    const totalCnt = first.getElementsByTagName("totalCnt")[0]?.textContent || "0"
+    const pageCount = wholeJo ? Math.min(5, Math.ceil((parseInt(totalCnt, 10) || 0) / 100)) : 1
+    const docs = [first, ...(await Promise.all(
+      Array.from({ length: Math.max(0, pageCount - 1) }, (_, i) => fetchPage(i + 2)),
+    )).map(x => parser.parseFromString(x, "text/xml"))]
+    const laws = docs.flatMap(d => {
+      const nodes = d.getElementsByTagName("law")
+      return Array.from({ length: nodes.length }, (_, i) => nodes[i])
+    })
 
     if (laws.length === 0) {
       return {
@@ -106,8 +123,9 @@ export async function getArticleHistory(
       }
     }
 
-    let resultText = `조문 개정 이력 (총 ${totalCnt}건):\n\n`
+    let resultText = ""
     let itemNum = 0
+    const wholeRevisions: string[] = []
 
     for (let i = 0; i < laws.length; i++) {
       const law = laws[i]
@@ -140,8 +158,20 @@ export async function getArticleHistory(
         resultText += `   - 변경사유: ${changeReason}\n`
         resultText += `   - 공포일: ${promDate}, 조문개정일: ${joRegDt}\n`
         resultText += `   - 시행일: ${effDate}, 조문시행일: ${joEffDt}\n\n`
+        if (/전부개정|폐지제정/.test(changeType)) wholeRevisions.push(effDate)
       }
     }
+    // 머리말은 셈이 끝난 뒤에 — 총계는 조문 변경 수가 아니라 법령 버전 수다
+    const header = wholeJo
+      ? `조문 개정 이력: ${formatJoCode(jo || "")} — 법령 버전 ${totalCnt}개 중 이 조문이 바뀐 버전 ${itemNum}건\n`
+      : `조문 개정 이력 (법령 버전 총 ${totalCnt}건 중 이 쪽${laws.length}건):\n`
+    const capNote = wholeJo && (parseInt(totalCnt, 10) || 0) > pageCount * 100
+      ? `⚠️ 법령 버전이 많아 앞 ${pageCount * 100}개만 봤습니다 — 기간(fromRegDt·toRegDt)으로 나눠 조회하세요.\n`
+      : ""
+    const wholeNote = wholeJo && wholeRevisions.length > 0
+      ? `⚠️ 전부개정(시행 ${wholeRevisions.join(", ")})은 조문 체계를 새로 짠다 — 그 전후의 같은 조번호는 다른 조문일 수 있습니다.\n`
+      : ""
+    resultText = `${header}${capNote}${wholeNote}\n${resultText}`
 
     // 조문이 하나도 없는 경우 (법령정보만 있는 경우)
     if (itemNum === 0) {

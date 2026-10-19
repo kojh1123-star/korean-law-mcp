@@ -5,11 +5,12 @@
 > 프로덕션은 이 레포가 아니라 **[gomdori-mcp](https://github.com/chrisryugj/gomdori-mcp) 통합 호스트**(fly 앱 `korean-law-mcp` 1대, MCP 5종 동거)가 서빙한다.
 > - 공식 주소: `https://mcp.gomdori.app/law` (구 `korean-law-mcp.fly.dev/mcp`는 하위호환으로 유지)
 > - **반영 절차**: 이 레포 커밋·푸시 → `npm publish` → **npm 전파 대기**(`npm view korean-law-mcp version`이 새 버전을 반환할 때까지 — 보통 30초 안쪽. 전파 전에 배포하면 이미지가 옛 버전을 설치한다) → `~/workspace/gomdori-mcp/Dockerfile`의 `korean-law-mcp@X.Y.Z` 핀 갱신 → `cd ~/workspace/gomdori-mcp && fly deploy -c fly.production.toml` → **GitHub Release 생성**(`gh release create vX.Y.Z`) → `gomdori-mcp/scripts/verify-deploy.sh` 로 사용자 경로 반영 확인
+>   - **MCP 레지스트리**: 릴리스 뒤 `mcp-publisher publish` (registry.modelcontextprotocol.io, `io.github.chrisryugj/korean-law-mcp`). `server.json`·`.claude-plugin/plugin.json`·`marketplace.json` version 과 plugin.json 의 npx 고정 버전(`korean-law-mcp@X.Y.Z`, Claude 디렉터리는 `@latest` 를 차단)은 package.json 과 같아야 하며 `verify:package` 가 막는다
 >   - **릴리스는 배포와 항상 같이 간다** — npm 게시만 하고 Release 를 빠뜨리면 이 레포의 릴리스 이력에 구멍이 남는다(v4.10.0·v4.11.0 이 그렇게 비었다가 2026-08-17 에 소급 생성됐다). 노트 본문은 CHANGELOG 의 해당 절을 옮긴다.
 >   - `.github/workflows/publish.yml`(GitHub Release → OIDC trusted publishing + provenance)은 **npm 쪽 trusted publisher 등록이 아직 안 됐다**. 그래서 게시는 위 로컬 `npm publish` 가 정규 경로이고, Release 는 그 뒤에 만든다 — 워크플로는 같은 버전이 이미 레지스트리에 있으면 게시를 건너뛰고 검증(typecheck·test·build·verify:package·audit)만 릴리스 시점에 재확인한다.
 > - **🚫 이 레포에서 `fly deploy` 직접 실행 절대 금지** — 통합 이미지를 law 단독 이미지로 덮어써 stats·patent·archhub·school까지 전부 죽는다. 자세한 배경: [docs/FLY-COST.md](docs/FLY-COST.md)
 
-Korean Law MCP Server v4.12.0 - 법제처 42개 API → 10개 통합 도구 (내부 98개) + 9개 시나리오 + 자연어 CLI + HTTP stateless + 판례 토큰 74% 감축 + **legal_research (체인 8종 통합, task 파라미터)** + **legal_analysis (인용검증·판례생사·행위시법·영향그래프 통합, mode 파라미터)** + **time_travel (시점 diff)** + **action_plan (이럴 땐 이렇게, 5단계 안내)** + **시행예정 감지 (search_law가 제명변경·미시행 개정 자동 병기)** + **ordinance_radar (조례 정비 레이더 — 근거 상위법 개정 자동 대조, v4.7.0)** + **인용 검증 표기 내성 (낫표·가운뎃점·`같은 법` 조응, v4.9.0)** + **폐지 감지 (검색 0건 시 폐지 법령·행정규칙 연혁 추적 — 폐지사유·후속 통합 규정 자동 안내, v4.10.0)**
+Korean Law MCP Server v4.15.9 - 법제처 42개 API → 10개 통합 도구 (내부 99개) + 9개 시나리오 + 자연어 CLI + HTTP stateless + 판례 토큰 74% 감축 + **legal_research (체인 8종 통합, task 파라미터)** + **legal_analysis (인용검증·판례생사·행위시법·영향그래프 통합, mode 파라미터)** + **time_travel (시점 diff)** + **action_plan (이럴 땐 이렇게, 5단계 안내)** + **시행예정 감지 (search_law가 제명변경·미시행 개정 자동 병기)** + **ordinance_radar (조례 정비 레이더 — 근거 상위법 개정 자동 대조, v4.7.0)** + **인용 검증 표기 내성 (낫표·가운뎃점·`같은 법` 조응, v4.9.0)** + **폐지 감지 (검색 0건 시 폐지 법령·행정규칙 연혁 추적 — 폐지사유·후속 통합 규정 자동 안내, v4.10.0)** + **search_law_bulk (등록부 대량 조회 + MST diff 감시, v4.13.0)** + **행정규칙 부분 조회 (get_admin_rule 의 jo·chapter·keyword·page — 통짜 전문을 조문 단위로, v4.14.0)** + **법령ID 계보 연혁 (제명이 바뀌기 전 버전까지 — search_historical_law·applicable_law·time_travel, get_annexes date 시점 별표, get_law_text efYd 기준일 보정, 행정규칙 기준일 판단, v4.15.0)**
 
 ## Structure
 
@@ -17,15 +18,16 @@ Korean Law MCP Server v4.12.0 - 법제처 42개 API → 10개 통합 도구 (내
 src/
 ├── index.ts              # 엔트리포인트 (STDIO/HTTP 모드)
 ├── cli.ts                # CLI v2.0 (자연어 라우팅 + REPL)
-├── tool-registry.ts      # 98개 도구 등록, V3_EXPOSED 10개만 노출 (TOOL_COUNTS 파생값)
+├── tool-registry.ts      # 99개 도구 등록, V3_EXPOSED 10개만 노출 (TOOL_COUNTS 파생값)
 ├── tools/                # 도구 구현 (76개 파일, scenarios/ 포함)
 ├── lib/
 │   ├── api-client.ts     # API 클라이언트 (throwIfError/checkHtmlError 통일)
 │   ├── query-router.ts   # 자연어 → 도구 라우팅 엔진 (verify/비교/시간필터 패턴 포함)
-│   ├── fetch-with-retry.ts  # 타임아웃/재시도 + maskSensitiveUrl (API키 로그 유출 방지)
+│   ├── fetch-with-retry.ts  # 시도당 30초·전체 45초 데드라인/재시도 + maskSensitiveUrl·maskKeysInText (API키 유출 방지)
+│   ├── fatal-errors.ts   # rethrowIfFatal: 보조 조회 catch 가 예산 소진·취소를 "0건"으로 삼키지 않게
 │   ├── session-state.ts  # 요청별 API 키·취소 신호·실행 예산 격리 (AsyncLocalStorage, stateless)
 │   ├── execution-limits.ts  # 요청 단위 실행 예산 (upstream 호출 수·본문 byte) + env 정수 검증
-│   ├── response-body.ts  # 예산·취소가 걸린 업스트림 본문 리더 (response.text() 대체)
+│   ├── response-body.ts  # 예산·취소·청크 무응답 20초가 걸린 업스트림 본문 리더 (response.text() 대체)
 │   ├── rate-limit.ts     # 토큰버킷 + 롤링 일일 캡 (폴백 쿼터 게이트, now 주입 테스트)
 │   ├── xml-parser.ts     # 공통 XML 파싱
 │   ├── errors.ts         # 에러 표준화
@@ -33,6 +35,13 @@ src/
 │   ├── search-normalizer.ts  # 검색어 정규화 (LexDiff, 약칭 표제 60건 — LAW_ALIAS_ENTRIES 항목 수 기준)
 │   ├── upcoming-laws.ts  # 시행예정 법령 감지 (eflaw 보조검색 — 제명변경·미시행 개정 병기)
 │   ├── abolished-laws.ts # 폐지 감지 (법령=eflaw·행정규칙=nw=2 연혁 — 폐지사유·후속 통합 규정 안내)
+│   ├── law-lineage.ts    # 법령ID 계보 (eflaw LID — 제명변경을 가로지르는 전 시행 버전, 옛 법령명→법령ID, 기준일 버전)
+│   ├── admin-rule-history.ts # 행정규칙 발령 연혁 (nw=2 검색 → 행정규칙ID로 묶기, 기준일 버전, 화재안전기준 코드)
+│   ├── admin-rule-articles.ts # 행정규칙 통짜 전문 → 조문 배열 파서 (^앵커 + 조문번호 단조증가)
+│   ├── admin-rule-views.ts   # 행정규칙 부분 조회 뷰 (jo·chapter·page) + 문서 캐시
+│   ├── admin-rule-jo.ts      # jo·chapter 입력 정규화 + 조문 찾기 (편·장 키 문법)
+│   ├── admin-rule-keyword.ts # keyword 뷰 — 조문 → 부칙·별표 순으로 찾기, 매칭 줄 중심 발췌
+│   ├── admin-rule-doc.ts     # 행정규칙 상세 XML → 파싱 문서 (캐시 적중 시 재파싱 없음)
 │   ├── law-parser.ts     # JO 코드 변환 (LexDiff)
 │   ├── annex-file-parser.ts  # 별표 파일 파서 (kordoc 통합 파서)
 │   ├── tool-profiles.ts  # 도구 카테고리 + TOOL_ALIASES (한국어 별칭 매칭)
@@ -107,7 +116,7 @@ korean-law get_law_text --mst 160001 --jo "제1조"
 - `MCP_MAX_UPSTREAM_REQUESTS`: 한 outer request가 사용할 수 있는 upstream attempt 수 (기본 `48`, 재시도/안티봇 hop 포함)
 - `MCP_MAX_UPSTREAM_BODY_BYTES` / `MCP_MAX_TOTAL_UPSTREAM_BODY_BYTES`: 단일/전체 upstream 응답 본문 byte 한도
 - `MCP_MAX_TOOL_RESPONSE_CHARS`: MCP 도구 응답 문자 한도 (기본 `50000`)
-- `MCP_CHAIN_DEADLINE_MS`: 체인 한 건의 데드라인 (기본 `45000`, 허용 `5000`~`300000`, HTTP 모드는 부팅 시점 fail-fast 검증). **적용 task는 `legal_research` 8종 중 `action_basis`·`full_research`·`dispute_prep` 3종** — 순차 사다리가 길어 인질 시나리오가 실측된 체인들이다. 나머지 task는 아직 미적용(개별 fetch 타임아웃만). 적용 체인은 기반 법령 탐색(프리픽스)부터 시계 안이며, 만료 시 받은 갈래까지 조립해 **부분 결과**를 돌려주고 못 받은 자리는 마커로 남긴다 — MCP 클라이언트 기본 타임아웃 60초보다 넉넉히 짧게 잡을 것
+- `MCP_CHAIN_DEADLINE_MS`: 체인 한 건의 데드라인 (기본 `45000`, 허용 `5000`~`300000`, HTTP 모드는 부팅 시점 fail-fast 검증). `legal_research` 8종과 `get_law_statistics`에 적용한다. 적용 체인은 기반 법령 탐색(프리픽스)부터 시계 안이며, 만료 시 받은 갈래까지 조립해 **부분 결과**를 돌려주고 못 받은 자리는 마커로 남긴다 — MCP 클라이언트 기본 타임아웃 60초보다 넉넉히 짧게 잡을 것
 
 ## Domain Knowledge
 
@@ -148,12 +157,13 @@ get_law_text(mst, jo="006300") → 제63조(휴직) 조회
 4. **도구 추가**: `tool-registry.ts`의 `allTools` 배열에 추가
 5. **truncateResponse 필수**: 모든 도구의 최종 출력에 `truncateResponse()` 적용. 한도는 **5만 자(UTF-16 code unit)**이지 50KB가 아니다 — 한글은 UTF-8로 자당 3바이트라 5만 자는 최대 150KB다(#92). `MCP_MAX_TOOL_RESPONSE_CHARS`는 **tool-registry의 최종 출력 게이트에만** 적용된다 — 도구 내부 호출들이 쓰는 기본 상수(`MAX_RESPONSE_SIZE`, 5만)는 env 로 움직이지 않으므로, 상향은 내부 절단에 막혀 무효이고 **하향만 실효**한다
 6. **단일 객체 정규화**: API 응답의 배열 필드가 단일 객체로 올 수 있음 — `Array.isArray(x) ? x : [x]` 패턴 사용
-7. **cleanHtml 재사용**: HTML 엔티티 디코딩은 `article-parser.ts`의 `cleanHtml()` 사용 (수동 디코딩 금지)
+7. **cleanHtml 재사용**: HTML 엔티티 디코딩은 `article-parser.ts`의 `cleanHtml()` 사용 (수동 디코딩 금지). 태그 제거는 영문 태그·주석만이다: `<개정 2012.8.1.>`·`부칙 <제N호,…>` 같은 한글 꺾쇠 표기는 개정 시점 근거라 남긴다(v4.14.2)
 8. **console.log/error 금지**: STDIO 모드에서 간섭 방지. 에러는 throw로 전파. HTTP 모드 에러 로깅은 반드시 `scrubError()` 경유 (API 키 유출 방지)
 9. **String() 방어 코딩**: MCP 클라이언트가 숫자를 보낼 수 있음 — `URLSearchParams.append(key, String(value))` 사용
-10. **캐시 키 분리**: `lawtext:` (law-text.ts, 문자열), `batch:` (batch-articles.ts, JSON 객체) — 타입 충돌 금지
-11. **API 키 마스킹**: URL/에러 메시지 외부 노출 전 `maskSensitiveUrl()` 적용. 새 fetch 래퍼 추가 시 주의
+10. **캐시 키 분리**: `lawtext:` (law-text.ts, 문자열, lawCache), `batch:` (batch-articles.ts, 파싱된 JSON 객체, **전용 `batchLawCache` 12건**: 전역 500건 캐시에 두면 큰 법령 한 건이 힙 4MB 대라 메모리를 먹는다), `admrulxml:` (admin-rule-doc.ts `AdminRuleDoc` 파싱 문서, 전용 캐시 20건 — applicable-admin-rule 의 선적재만 XML 문자열을 넣고 get_admin_rule 이 첫 조회 때 문서로 바꿔 넣는다), `mstlawid:` (law-text.ts, mst→법령ID 문자열, 24시간), `lineage:` (law-text.ts, 법령ID 계보 `HistoricalVersion[]`, 1시간), `precedentCache` (precedents.ts, 전용 20건, ID:caseName 키, 파싱된 PrecService record, 24시간 — 상세 full·축약 렌더와 cite_check가 공유하며 원시 JSON은 보관하지 않는다) — 타입 충돌 금지. lawId 만 준 "현행" 본문은 개정 시행일을 넘기면 낡으므로 TTL 1시간(MST·efYd 는 24시간)
+11. **API 키 마스킹**: URL/에러 메시지 외부 노출 전 `maskSensitiveUrl()` 적용. 새 fetch 래퍼 추가 시 주의. 도구 **출력 전체**는 tool-registry 최종 게이트가 `maskKeysInText()` 로 한 번 더 가린다(법제처 상세링크에 요청 OC 가 실려 와 서버 키가 노출되던 문제, v4.14.1)
 12. **full 옵션 일관성**: 판례류 도메인 추가 시 `unified-decisions.ts`의 `ALREADY_COMPACTED` set 고려. 자체 compact 미구현이면 `compactLongSections` 후처리에 자동 편입됨
+13. **인자 길이 상한**: tool-registry 가 스키마 검증 전에 모든 문자열 인자를 본다(중첩 포함). 일반 2,000자, `text` 50,000자. 사용자 입력이 닿는 정규식은 그래도 선형이어야 한다: 공백 연속은 먼저 뭉치고(`\s+` → `" "`), 라벨과 값 사이 간격은 `{0,200}` 처럼 상한을 둔다(v4.14.1 ReDoS 3경로)
 
 ## Key Files
 
@@ -161,17 +171,19 @@ get_law_text(mst, jo="006300") → 제63조(휴직) 조회
 |------|------|
 | `cli.ts` | CLI v2.0 — 자연어 라우팅 + REPL |
 | `lib/query-router.ts` | 자연어 → 도구 자동 라우팅 (verify/비교/시간필터/impact_map/time_travel/action_plan 포함) |
-| `tool-registry.ts` | 98개 도구 정의, V3_EXPOSED 10개 노출 (TOOL_COUNTS 파생값) |
+| `tool-registry.ts` | 99개 도구 정의, V3_EXPOSED 10개 노출 (TOOL_COUNTS 파생값) |
 | `tools/legal-research.ts` | chain_* 8개 통합 진입점 — task 파라미터 디스패치 (v4.4.0) |
 | `tools/legal-analysis.ts` | 킬러피처 4개 통합 진입점 — mode 파라미터 디스패치 (v4.4.0) |
 | `tools/verify-citations.ts` | LLM 환각 방지 인용 검증 (v3.5 killer feature) |
 | `tools/impact-map.ts` | 조문 영향 그래프 + mermaid 시각화 (v4.0 killer feature) |
 | `tools/cite-check.ts` | 판례 생사 확인 — 후속 인용 역추적 + 별칭 추적 변경·폐기 감지 (v4.3 killer feature) |
-| `tools/applicable-law.ts` | 행위시법 판단 — 시점 적용 버전 특정 + 부칙 경과규정 발췌 (v4.3 killer feature) |
+| `tools/applicable-law.ts` | 행위시법 판단 — 시점 적용 버전 특정 + 부칙 경과규정 발췌 (v4.3 killer feature). 버전은 `lib/law-lineage` 계보로 특정 (v4.15.0) |
+| `tools/applicable-admin-rule.ts` | applicable_law 의 행정규칙 갈래 — 법령이 아닌 이름을 발령 연혁으로 판단 (v4.15.0) |
+| `tools/annex-history.ts` | get_annexes 의 `date` 갈래 — 기준일 시행 버전(eflaw MST+efYd)의 별표 (v4.15.0) |
 | `tools/ordinance-radar.ts` | 조례 정비 레이더 — 제1조(목적) 근거법 추출 + 상위법 개정 대조 자동 플래그 (v4.7.0 killer feature) |
 | `tools/unified-decisions.ts` | 17개 도메인 통합 + compactLongSections 후처리 축약 |
 | `lib/decision-compact.ts` | 판례 토큰 최적화 (compactBody/densify/stripRepeatedSummary/compactLongSections) |
-| `lib/fetch-with-retry.ts` | 30초 타임아웃 + 3회 재시도 + maskSensitiveUrl |
+| `lib/fetch-with-retry.ts` | 시도당 30초·전체 45초 데드라인 + 3회 재시도 + maskSensitiveUrl·maskKeysInText |
 | `lib/session-state.ts` | AsyncLocalStorage 요청 컨텍스트 (API 키) |
 | `lib/historical-utils.ts` | 연혁 raw 추출 (time_travel 시나리오용, v4.0) |
 | `lib/annex-file-parser.ts` | 별표 파싱 (kordoc 3.0 통합 파서) |

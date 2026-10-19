@@ -2,11 +2,15 @@ import { z } from "zod"
 import type { LawApiClient } from "../lib/api-client.js"
 import { cleanHtml } from "../lib/article-parser.js"
 import { truncateResponse } from "../lib/schemas.js"
-import { formatToolError, notFoundResponse } from "../lib/errors.js"
+import { SimpleCache } from "../lib/cache.js"
+import { ErrorCodes, LawApiError, formatToolError, notFoundResponse } from "../lib/errors.js"
 import { fetchWithRetry } from "../lib/fetch-with-retry.js"
 import { readResponseText } from "../lib/response-body.js"
 import { UpstreamRecordMissingError } from "../lib/upstream-miss.js"
 import { containsHtmlMarkup } from "../lib/body-shape.js"
+import { fieldText } from "../lib/precedent-body.js"
+import { rethrowIfFatal } from "../lib/fatal-errors.js"
+import { throwIfRequestCancelled } from "../lib/session-state.js"
 import {
   type ExternalHttpsProxyConfig,
   getExternalHttpsProxyConfig,
@@ -18,12 +22,12 @@ import {
   densifyPrecedentRefs,
   stripRepeatedSummary,
 } from "../lib/decision-compact.js"
-import { searchPrecedentsStructured, type StructuredPrecedentSearchResult } from "./precedent-search-core.js"
+import { precedentSearchScope, searchPrecedentsStructured, type StructuredPrecedentSearchResult } from "./precedent-search-core.js"
 
 export const searchPrecedentsSchema = z.object({
   query: z.string().optional().describe("검색 키워드 (예: '자동차', '담보권')"),
-  search: z.number().int().min(1).max(2).optional()
-    .describe("검색범위: 1=판례명 검색(기본), 2=본문검색"),
+  search: z.union([z.number().int().min(1).max(2), z.literal("both")]).optional()
+    .describe("검색범위: 1=판례명 검색(기본), 2=본문검색, \"both\"=판례명+본문 합침(법리·사실관계·유사판례 탐색용, 판례ID 중복 제거)"),
   court: z.string().optional().describe("법원명 필터 (예: '대법원', '서울고등법원')"),
   caseNumber: z.string().optional().describe("사건번호 (예: '2009느합133')"),
   display: z.number().min(1).max(100).default(20).describe("결과 수 (기본:20, 최대:100)"),
@@ -56,7 +60,7 @@ function renderNoPrecedentResult(result: StructuredPrecedentSearchResult): strin
   }
   lines.push("")
   lines.push("대안:")
-  lines.push(`  1. 해석례 검색: search_interpretations(query="${kw}")`)
+  lines.push(`  1. 해석례 검색: search_decisions(domain="interpretation", query="${kw}")`)
   lines.push(`  2. 법령 검색: search_law(query="${kw}")`)
   return lines.join("\n")
 }
@@ -65,7 +69,12 @@ export function renderPrecedentSearchResult(result: StructuredPrecedentSearchRes
   const args = result.originalArgs
   if (result.hits.length === 0) return renderNoPrecedentResult(result)
 
-  let output = `판례 검색 결과 (총 ${result.totalCount}건, ${result.page}페이지)`
+  // both 로 두 검색이 다 돈 경우: attempts[0]=제목, [1]=본문 (fallback 으로 넘어갔으면 일반 렌더)
+  const both = precedentSearchScope(args) === "both" && !result.fallbackUsed && result.attempts.length === 2
+  const scopeCount = (i: number) => (args.fromDate || args.toDate) ? result.attempts[i].hitCount : result.attempts[i].totalCount
+  let output = both
+    ? `판례 검색 결과 (제목검색 ${scopeCount(0)}건 · 본문검색 ${scopeCount(1)}건, 중복 제외 ${result.hits.length}건 표시, ${result.page}페이지)`
+    : `판례 검색 결과 (총 ${result.totalCount}건, ${result.page}페이지)`
   if (args.fromDate || args.toDate) {
     output += ` [기간: ${args.fromDate || "시작"} ~ ${args.toDate || "종료"}]`
   }
@@ -80,8 +89,8 @@ export function renderPrecedentSearchResult(result: StructuredPrecedentSearchRes
     if (hit.outOfRequestedDateRange) {
       output += `  범위: 요청 기간 밖 fallback 결과\n`
     }
-    if (hit.link) {
-      output += `  링크: ${hit.link}\n`
+    if (both) {
+      output += `  적중: ${hit.searchMode === 2 ? "본문검색" : "제목검색"}\n`
     }
     output += `\n`
   }
@@ -94,8 +103,17 @@ export function renderPrecedentSearchResult(result: StructuredPrecedentSearchRes
     output += `검색 보정: ${attempt.reason}="${label}" (${scope}${dateNote})\n\n`
   }
 
+  // 안내는 직접 노출 도구(V3_EXPOSED)로 적는다. get_precedent_text·find_similar_precedents 는
+  // 목록에 없어서 이름 그대로 부르면 클라이언트가 막는다.
   if (result.hits[0]?.id) {
-    output += `💡 다음: get_precedent_text(id="${result.hits[0].id}") 로 판결문 전문. full=true 로 축약 해제. 유사판례 원하면 find_similar_precedents 사용.\n`
+    output += `💡 다음: get_decision_text(domain="precedent", id="${result.hits[0].id}") 로 판결문 전문. full=true 로 축약 해제. 유사판례 원하면 execute_tool(tool_name="find_similar_precedents", params={query:"…"}) 사용.\n`
+  }
+
+  // 제목에 우연히 맞은 몇 건으로 끝났을 수 있다 (#167). 법리 탐색이면 본문검색 쪽이 훨씬 넓다.
+  const attempt = result.successfulAttempt
+  if (args.query && !result.fallbackUsed && attempt?.reason === "original_query" && attempt.search === 1 &&
+      precedentSearchScope(args) === 1 && result.totalCount <= 3) {
+    output += `💡 제목검색 적중이 ${result.totalCount}건뿐입니다. 법리·사실관계·유사판례 탐색이면 본문검색도 보세요: search_decisions(domain="precedent", query="${args.query}", options={search:"both"}) (본문만은 search:2).\n`
   }
 
   return output
@@ -149,6 +167,35 @@ interface PrecedentContent {
   전문?: string
 }
 
+/** 큰 판결문을 전역 법령 캐시 500건에 쌓지 않는다. JSON 파싱은 cache miss에만 한다. */
+export const precedentCache = new SimpleCache(20)
+
+/** 상세 렌더와 인용 추적이 같은 원문 record를 공유한다. 원시 JSON은 보관하지 않는다. */
+export async function getPrecedentRecord(
+  apiClient: LawApiClient,
+  args: GetPrecedentTextInput,
+): Promise<Record<string, unknown> | null> {
+  throwIfRequestCancelled()
+  const cacheKey = `${args.id}:${args.caseName ?? ""}`
+  const cached = precedentCache.get<Record<string, unknown>>(cacheKey)
+  if (cached) return cached
+  const extraParams: Record<string, string> = { ID: args.id }
+  if (args.caseName) extraParams.LM = args.caseName
+  const text = await apiClient.fetchApi({
+    endpoint: "lawService.do", target: "prec", type: "JSON", extraParams, apiKey: args.apiKey,
+  })
+  throwIfRequestCancelled()
+  const data: unknown = JSON.parse(text)
+  if (isMissingPrecedentJson(data)) return null
+  const record = (data as { PrecService: Record<string, unknown> }).PrecService
+  if (typeof record !== "object" || Array.isArray(record)) return null
+  if (![record.판시사항, record.판결요지, record.판례내용].some(value => normalizeHtmlText(fieldText(value)))) {
+    throw new LawApiError(`판례 ID ${args.id}: 메타데이터·참조만 반환되어 판결 본문을 확인하지 못했습니다. 자료의 부존재로 단정하지 마세요.`, ErrorCodes.UPSTREAM_NO_DATA)
+  }
+  precedentCache.set(cacheKey, record, 24 * 60 * 60 * 1000)
+  return record
+}
+
 function formatPrecedentText(
   basic: PrecedentBasic,
   content: PrecedentContent,
@@ -188,7 +235,8 @@ function formatPrecedentText(
   return output;
 }
 
-function normalizeHtmlText(html: string): string {
+/** 테스트 도달용 공개. 프로덕션 소비자는 이 파일 안뿐이다 */
+export function normalizeHtmlText(html: string): string {
   const withBlockBreaks = html
     .replace(/<\s*br\s*\/?>/gi, "\n")
     .replace(/<\/\s*(p|div|tr|table|tbody|thead|tfoot|ul|ol|li|h[1-6])\s*>/gi, "\n")
@@ -199,9 +247,11 @@ function normalizeHtmlText(html: string): string {
   return cleanHtml(withBlockBreaks)
     .replace(/\r/g, "")
     .replace(/\u00a0/g, " ")
+    // 2026-09-23 리뷰 C7: `[ \t]+\n` 은 긴 공백 덩어리에서 제곱이다(&nbsp; 3만 개 842ms, 10만 개 13.8초).
+    // 덩어리를 먼저 한 칸으로 접으면 같은 결과를 선형으로 낸다(퍼즈 30만 건 차이 0).
+    .replace(/[ \t]{2,}/g, " ")
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n[ \t]+/g, "\n")
-    .replace(/[ \t]{2,}/g, " ")
     .replace(/\n{3,}/g, "\n\n")
     .trim()
 }
@@ -333,6 +383,7 @@ async function fetchManualRedirect(
   }
 
   const response = await fetchWithRetry(url, { redirect: "manual" })
+  void response.body?.cancel().catch(() => {})
   return {
     status: response.status,
     location: response.headers.get("location"),
@@ -440,7 +491,7 @@ async function fetchHtmlFallbackPrecedent(
       판결유형: dcm.ntstDcmClNm,
     },
     content: {
-      판결요지: dcm.ntstDcmGistCntn,
+      판결요지: dcm.ntstDcmGistCntn && normalizeHtmlText(String(dcm.ntstDcmGistCntn)),
       전문: body,
     },
   }
@@ -454,21 +505,17 @@ export async function getPrecedentText(
     const extraParams: Record<string, string> = { ID: args.id };
     if (args.caseName) extraParams.LM = args.caseName;
 
-    let responseText: string;
+    let prec: Record<string, unknown> | null
     try {
-      responseText = await apiClient.fetchApi({
-        endpoint: "lawService.do",
-        target: "prec",
-        type: "JSON",
-        extraParams,
-        apiKey: args.apiKey,
-      });
+      prec = await getPrecedentRecord(apiClient, args)
     } catch (err) {
+      rethrowIfFatal(err)
       // 확인 재시도까지 마친 미스는 판정이 끝났다 — HTML 폴백을 더 돌아도 같은 답이고
       // 왕복만 는다. 국세법령정보 판례는 이 가지로 오지 않는다: 실측(ID 615819)상
       // 88바이트 `{"Law": "일치하는 판례가 없습니다…"}` 봉투로 와서, 아래
       // isMissingPrecedentJson 분기가 폴백을 태운다.
       if (err instanceof UpstreamRecordMissingError) throw err
+      if (err instanceof LawApiError && err.code === ErrorCodes.UPSTREAM_NO_DATA) throw err
       const fallback = await fetchHtmlFallbackPrecedent(apiClient, args, extraParams)
       const output = formatPrecedentText(fallback.basic, fallback.content, args.full)
       return {
@@ -479,10 +526,7 @@ export async function getPrecedentText(
       };
     }
 
-  let data: any;
-  try {
-    data = JSON.parse(responseText);
-  } catch (err) {
+  if (!prec) {
     const fallback = await fetchHtmlFallbackPrecedent(apiClient, args, extraParams)
     const output = formatPrecedentText(fallback.basic, fallback.content, args.full)
     return {
@@ -493,37 +537,24 @@ export async function getPrecedentText(
     };
   }
 
-  if (isMissingPrecedentJson(data)) {
-    const fallback = await fetchHtmlFallbackPrecedent(apiClient, args, extraParams)
-    const output = formatPrecedentText(fallback.basic, fallback.content, args.full)
-    return {
-      content: [{
-        type: "text",
-        text: truncateResponse(output)
-      }]
-    };
-  }
-
-  if (!data.PrecService) {
-    throw new Error("Precedent not found or invalid response format");
-  }
-
-  const prec = data.PrecService;
   // API returns fields directly in PrecService, not nested
   const basic = {
-    판례명: prec.사건명,
-    사건번호: prec.사건번호,
-    법원명: prec.법원명,
-    선고일자: prec.선고일자,
-    사건종류명: prec.사건종류명,
-    판결유형: prec.판결유형
+    판례명: fieldText(prec.사건명),
+    사건번호: fieldText(prec.사건번호),
+    법원명: fieldText(prec.법원명),
+    선고일자: fieldText(prec.선고일자),
+    사건종류명: fieldText(prec.사건종류명),
+    판결유형: fieldText(prec.판결유형)
   };
+  // 법제처 JSON 필드는 줄바꿈을 <br/> 로 싣는다. 전문 축약의 문장 경계("다.\n")도 이걸 펴야 잡힌다.
+  // 폴백 본문은 이미 정규화돼 오므로 여기(JSON 경로)서만 편다 — 두 번 돌리면 풀린 &lt; 뒤 글자가 태그로 지워진다
+  const clean = (v: unknown) => normalizeHtmlText(fieldText(v))
   const content = {
-    판시사항: prec.판시사항,
-    판결요지: prec.판결요지,
-    참조조문: prec.참조조문,
-    참조판례: prec.참조판례,
-    전문: prec.판례내용
+    판시사항: clean(prec.판시사항),
+    판결요지: clean(prec.판결요지),
+    참조조문: clean(prec.참조조문),
+    참조판례: clean(prec.참조판례),
+    전문: clean(prec.판례내용)
   };
 
   const output = formatPrecedentText(basic, content, args.full)
@@ -535,6 +566,7 @@ export async function getPrecedentText(
     }]
   };
   } catch (error) {
+    rethrowIfFatal(error)
     // 두 원천(JSON 봉투 + HTML 폴백)이 나란히 없다고 답한 경우만 부존재로 표면화한다.
     // 폴백 기구 고장은 여전히 외부 API 오류다.
     if (error instanceof PrecedentAbsentError) {

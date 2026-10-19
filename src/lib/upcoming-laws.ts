@@ -10,6 +10,7 @@
 import type { LawApiClient } from "./api-client.js"
 import { lawCache } from "./cache.js"
 import { extractTag } from "./xml-parser.js"
+import { rethrowIfFatal } from "./fatal-errors.js"
 
 export interface UpcomingLaw {
   name: string
@@ -54,24 +55,40 @@ export function parseUpcomingXml(xmlText: string): UpcomingLaw[] {
   return out
 }
 
-/** 시행예정 법령 조회 — 보조 정보이므로 실패는 전파하지 않고 빈 배열 */
+/**
+ * 시행예정 법령 조회. 보조 정보라 일시 장애는 전파하지 않되, "확인했고 없음"([])과
+ * "확인 못 함"(null)을 구분한다. 종전엔 둘 다 [] 여서 장애 한 번이 "시행예정 없음"으로
+ * 바뀌었고, search_law 는 그 결과를 1시간 캐시했으며 search_law_bulk diff 는 해당 법령을
+ * "본문 동일, 생략"으로 넘겼다(2026-09-23 리뷰 A4·B6, 재현). 예산 소진·취소는 다시 던진다.
+ */
 export async function fetchUpcomingLaws(
   apiClient: LawApiClient,
   query: string,
   apiKey?: string
-): Promise<UpcomingLaw[]> {
+): Promise<UpcomingLaw[] | null> {
   const cacheKey = `upcoming:${query.toLowerCase().trim()}`
   const cached = lawCache.get<UpcomingLaw[]>(cacheKey)
   if (cached) return cached
   try {
-    const xml = await apiClient.searchLaw(query, apiKey, 30, "eflaw")
+    // nw=2(시행예정만)·display=100. nw 없이 30건을 받으면 연혁 행이 창을 채운다. 실측(2026-09-23,
+    // 도로교통법): 전체 489건 중 첫 30건이 연혁 27·현행 1·시행예정 2여서 시행규칙 개정 2건이
+    // 빠졌다. nw=2 로는 시행예정 4건이 정확히 온다(리뷰 A2).
+    const xml = await apiClient.searchLaw(query, apiKey, 100, "eflaw", "2")
     const parsed = parseUpcomingXml(xml)
     lawCache.set(cacheKey, parsed, 60 * 60 * 1000)
     return parsed
-  } catch {
-    return []
+  } catch (error) {
+    rethrowIfFatal(error)
+    return null
   }
 }
+
+/** 시행예정 확인이 실패했을 때 결과에 붙이는 한 줄. 침묵하면 "시행예정 없음"으로 읽힌다 */
+export const UPCOMING_CHECK_FAILED_NOTE =
+  "⚠️ 시행예정(공포 후 미시행) 개정 확인이 일시 장애로 실패했습니다. 시행예정 여부가 중요하면 잠시 후 다시 조회하세요.\n"
+
+/** 병기 상한 — 초과분은 침묵하지 않고 "외 N건"으로 알린다 (#156) */
+const MAX_UPCOMING_NOTES = 5
 
 const fmtDate = (d: string) => (d.length === 8 ? `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6)}` : d)
 
@@ -88,7 +105,15 @@ export function buildUpcomingNotes(
   if (upcoming.length === 0) return ""
   const hitById = new Map(hits.map(h => [h.lawId, h]))
   const lines: string[] = []
-  for (const u of upcoming.slice(0, 5)) {
+
+  // 시행 임박순으로 정렬한 뒤 자른다. 종전엔 API 응답 순서(먼 시행일부터)를 그대로
+  // slice(0,5) 해서 가장 급한 개정이 먼저 버려졌다 — 실측(#156, 대기환경보전법):
+  // 시행예정 6건 중 가장 임박한 2026-09-18 이 잘리고 2027-01-10 이 남았다.
+  // 준법 감시 용도에선 정확히 반대 순서다.
+  const sorted = [...upcoming].sort((a, b) =>
+    (a.effDates[0] || "99999999").localeCompare(b.effDates[0] || "99999999"))
+
+  for (const u of sorted.slice(0, MAX_UPCOMING_NOTES)) {
     const eff = u.effDates.map(fmtDate).join(" · ")
     // 시행예정본은 efYd 없이는 법제처 API가 404 — 반드시 시행일 병기
     const joHint = u.effDates[0]
@@ -103,6 +128,12 @@ export function buildUpcomingNotes(
     } else {
       lines.push(`🔜 시행예정 ${u.lawType || "법령"}: 「${u.name}」 ${tail} — 아직 미시행이라 현행 검색에는 없음`)
     }
+  }
+
+  // 잘렸으면 반드시 말한다. 침묵하면 사용자는 표시된 게 전부라고 믿는다 (#156).
+  const hidden = sorted.length - MAX_UPCOMING_NOTES
+  if (hidden > 0) {
+    lines.push(`🔜 …외 ${hidden}건 더 있음 (시행 임박순 ${MAX_UPCOMING_NOTES}건만 표시) — 전수는 법제처 eflaw(시행일자별 법령) 조회 필요`)
   }
   return lines.join("\n") + "\n"
 }
