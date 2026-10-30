@@ -43,7 +43,7 @@ node scripts/oauth-account.mjs
 | `OAUTH_ADMIN_IDS` | 관리자 화면을 허용할 기존 직원 아이디. 여러 명은 쉼표 구분. 생략하면 관리자 화면 사용 불가. 이 저장소는 공개되어 있으므로 실제 관리자 아이디는 문서에 적지 않습니다. |
 | `OAUTH_DB_PATH` | `/data/oauth/oauth.sqlite` — Docker 기본값 |
 | `TRUST_PROXY` | `1` — Railway 프록시 1단 구성 기준 |
-| `MCP_AUTH_TOKEN` | 기존 값 유지. OAuth Client Secret으로 사용하지 않습니다. |
+| `MCP_AUTH_TOKEN` | 관리용 공용 토큰. OAuth Client Secret으로 사용하지 않습니다. **2026-10 Railway 보안 사고 이전 값은 재사용 금지** — 새 값으로 교체하거나, 쓰는 곳이 없으면 변수를 삭제합니다(10절). |
 | `LAW_OC` | 기존 값 유지 |
 | `FALLBACK_DAILY_CAP` | 기존 양수 값 유지. `0`이면 하루 상한이 **꺼져 무제한**이 됩니다(차단이 아님). 서버 키 사용 자체를 막으려면 `FALLBACK_RATE_LIMIT_RPM=0`을 씁니다. |
 | `ALLOW_QUERY_API_KEY` | 직원 OAuth 사용에는 필요하지 않으며 `0` 권장 |
@@ -187,3 +187,42 @@ Claude에서 **Customize → Connectors → Add custom connector**를 열어 다
 직원 아이디·비밀번호는 이후 MCP 로그인 페이지에서만 입력합니다. Client ID를 직접 지정하는 방식을 선택했다면 서버에 미리 등록된 공개 Client ID `claude-web`을 사용할 수 있으며, Client Secret은 비워둡니다. 이 값은 세 서비스 공통입니다. 직원 비밀번호나 기관 인증키를 Client Secret에 입력하지 않습니다.
 
 `claude-web`은 공식 Claude 웹 콜백만 허용하며, PKCE와 직원 로그인·동의, 기존 서비스별 연결 제한을 유지합니다. 운영자가 `OAUTH_REDIRECT_URIS`에서 Claude 콜백을 제외하면 이 고정 클라이언트도 비활성화됩니다. 오류 페이지는 입력값이나 직원 계정 존재 여부를 노출하지 않고 `OAUTH_CLIENT_INVALID` 진단 코드와 재등록 방법을 표시합니다.
+
+## 10. Railway 보안 사고(2026-10) 이후 재가동
+
+Railway는 2026-10-20 인지한 침해로 고객 **환경변수(Variables)** 가 읽히고 일부 복호화됐을 수 있다고 공지하고, 전체 사용자에게 키 교체를 권고했습니다. 침투 경로와 볼륨 노출 여부는 이 문서 작성 시점(2026-10-30)까지 공개되지 않았습니다.
+
+직원 로그인(OAuth)은 MCP 주소로 들어오는 요청을 막는 장치이며, 플랫폼 저장소에서 변수를 직접 읽는 공격은 막지 못합니다. 서비스가 꺼져 있었더라도 프로젝트에 남은 변수는 노출 대상일 수 있으므로 **사고 이전 값은 모두 유출된 것으로 간주**합니다.
+
+### 재가동 전 (배포하지 않은 상태에서)
+
+1. 외부 인증키 재발급·교체: `LAW_OC`, `G2B_API_KEY`, `KOSIS_TOKEN`.
+2. `MCP_AUTH_TOKEN`: 사용처가 없으면 **삭제**, 필요하면 관리자 PC에서 새 값을 만들어 교체합니다. 값은 채팅·이슈·문서에 붙여넣지 않습니다.
+
+```powershell
+node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
+```
+
+3. 설정값 점검: `OAUTH_ENABLED=1`, `ALLOW_QUERY_API_KEY=0`, `MCP_ALLOW_UNAUTHENTICATED_REMOTE` 없음(또는 `0`), `TRUST_PROXY=1`.
+4. 볼륨(`/data`)과 서비스 도메인이 남아 있는지 확인합니다. 결과에 따라 아래 두 경우로 나뉩니다.
+
+### 경우 A — 볼륨과 도메인이 남아 있음
+
+- `OAUTH_ISSUER`와 볼륨을 그대로 유지하고 배포합니다(다른 issuer로 기존 DB를 열면 시작이 거부됩니다).
+- 배포 직후 `/admin`에서 **관리자 본인 비밀번호**(내 로그인 정보 변경)와 **모든 직원 비밀번호**(비밀번호 초기화)를 바꿉니다. `OAUTH_USERS_JSON`의 해시가 노출됐을 수 있고, 짧거나 흔한 비밀번호는 해시에서 역산될 수 있기 때문입니다. 화면에서 바꾼 비밀번호는 DB 해시가 우선하므로 옛 환경변수 해시로는 로그인할 수 없게 됩니다.
+- **복구 코드를 재발급**하고 새 코드를 별도로 보관합니다.
+- 관리 작업 기록·최근 요청에서 사고 전후 낯선 계정 활동이 없는지 확인합니다.
+
+### 경우 B — 볼륨이나 도메인이 없어짐
+
+- 계정·사용량은 볼륨에만 있으므로 새로 설치합니다. 별도로 내려받아 둔 **백업 JSON**이 있으면 같은 도메인일 때만 복원할 수 있습니다.
+- `node scripts/oauth-account.mjs`로 **새 비밀번호**를 넣어 `OAUTH_USERS_JSON`을 다시 만듭니다. 옛 JSON을 재사용하지 않습니다.
+- 도메인이 바뀌면 `OAUTH_ISSUER`, 이 문서의 주소, 직원 커넥터 URL을 모두 새 주소로 바꾸고 직원은 커넥터를 다시 등록합니다.
+
+### 확인
+
+- `node scripts/check-oauth.mjs <서비스 주소>`가 `PASS`인지 확인합니다.
+- 인증 없이 `/mcp`에 `tools/call`을 보내면 401이 나와야 합니다. 옛 `MCP_AUTH_TOKEN`으로 보내도 401이어야 합니다.
+- 직원 한 명이 새 비밀번호로 ChatGPT 또는 Claude에서 연결해 조회까지 되는지 확인합니다.
+
+근거(2026-10-30 확인): [TechCrunch 2026-10-22](https://techcrunch.com/2026/10/22/developer-platform-railway-urges-all-users-to-revoke-secret-keys-after-cyberattack/), [The Hacker News](https://thehackernews.com/2026/10/railway-says-intruder-may-have-accessed.html). 사고 사실과 키 교체 권고는 신뢰도 높음, 침투 경로·볼륨 노출 범위는 미공개입니다. Railway 사후 분석이 공개되면 이 절을 갱신합니다.
