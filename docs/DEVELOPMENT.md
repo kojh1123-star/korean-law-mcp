@@ -205,39 +205,10 @@ Conventional Commits:
 
 ## 배포
 
-### npm
+이 포크(kojh1123-star/korean-law-mcp)는 별도 배포 대상이 없다 — gomdori-mcp 통합 호스트·Railway·npm 게시를 쓰지 않는다(npm 패키지 `korean-law-mcp` 게시 권한은 업스트림에만 있다).
 
-```bash
-npm version patch  # 버전 bump
-git push --follow-tags
-npm publish        # 로컬 게시가 정규 경로 (2FA)
-npm view korean-law-mcp version  # 새 버전을 반환할 때까지 대기 — npm 전파
-```
-
-> ⚠️ `.github/workflows/publish.yml`(GitHub Release → OIDC trusted publishing + provenance)은 **npm 쪽 trusted publisher 등록이 아직 안 됐다**. 그래서 게시는 위 로컬 `npm publish`가 정규 경로이고, GitHub Release는 게시 뒤 통합 호스트 배포까지 마친 다음에 만든다(아래 반영 절차 6). 워크플로는 같은 버전이 이미 레지스트리에 있으면 게시를 건너뛰고 검증(typecheck·test·build·verify:package·audit)만 릴리스 시점에 재확인한다.
-
-### 통합 호스트 (프로덕션)
-
-> 🚫 **이 레포에서 `fly deploy`/`flyctl deploy` 직접 실행 절대 금지.**
-> 프로덕션은 이 레포가 아니라 [gomdori-mcp](https://github.com/chrisryugj/gomdori-mcp) 통합
-> 호스트(fly 앱 `korean-law-mcp` 1대에 MCP 5종 동거)가 서빙한다. 여기서 배포하면 통합 이미지를
-> law 단독 이미지로 덮어써 stats·patent·archhub·school까지 전부 죽는다. 배경: [FLY-COST.md](FLY-COST.md)
-
-반영 절차:
-
-```bash
-# 1) 이 레포 커밋·푸시
-# 2) npm publish
-# 3) npm 전파 대기 — npm view korean-law-mcp version 이 새 버전을 반환할 때까지 (보통 30초 안쪽)
-#    전파 전에 배포하면 이미지가 옛 버전을 설치한다
-# 4) ~/workspace/gomdori-mcp/Dockerfile 의 korean-law-mcp@X.Y.Z 핀 갱신
-# 5) cd ~/workspace/gomdori-mcp && fly deploy -c fly.production.toml
-# 6) gh release create vX.Y.Z  — 노트 본문은 CHANGELOG.md 의 해당 버전 절을 옮긴다
-# 7) gomdori-mcp/scripts/verify-deploy.sh 로 사용자 경로 반영 확인
-```
-
-- **릴리스는 배포와 항상 같이 간다** — npm 게시만 하고 Release를 빠뜨리면 이 레포의 릴리스 이력에 구멍이 남는다(v4.10.0·v4.11.0이 그렇게 비었다가 2026-08-17에 소급 생성됐다).
-- 공식 주소: `https://mcp.gomdori.app/law` (구 `korean-law-mcp.fly.dev/mcp`는 하위호환 유지)
+- **반영 절차**: 이 레포 커밋·푸시까지가 전부다.
+- fly는 쓰지 않는다 — 이 레포에서 `fly deploy`를 실행하지 않는다.
 
 ### Docker (자체 호스팅)
 
