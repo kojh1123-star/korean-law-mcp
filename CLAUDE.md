@@ -165,6 +165,16 @@ get_law_text(mst, jo="006300") → 제63조(휴직) 조회
 12. **full 옵션 일관성**: 판례류 도메인 추가 시 `unified-decisions.ts`의 `ALREADY_COMPACTED` set 고려. 자체 compact 미구현이면 `compactLongSections` 후처리에 자동 편입됨
 13. **인자 길이 상한**: tool-registry 가 스키마 검증 전에 모든 문자열 인자를 본다(중첩 포함). 일반 2,000자, `text` 50,000자. 사용자 입력이 닿는 정규식은 그래도 선형이어야 한다: 공백 연속은 먼저 뭉치고(`\s+` → `" "`), 라벨과 값 사이 간격은 `{0,200}` 처럼 상한을 둔다(v4.14.1 ReDoS 3경로)
 
+### 가드 훅 (규칙 강제 장치)
+
+- **가드 (플러그인 불필요)**: `.claude/settings.json` → `.claude/hooks/guard.mjs` (PreToolUse, matcher `Edit|Write|MultiEdit|Bash|PowerShell`)
+  - **차단**: 규칙 #1의 LexDiff 이식 파일 3종 수정, 이 레포에서의 `fly deploy`(gomdori-mcp 밖) — exit 2. 셸 검사는 Bash·PowerShell의 흔한 쓰기 형태(`sed -i`·리다이렉트·`tee`·`cp`·`mv`·`rm`·`Set-Content`·`Out-File`·`Copy-Item`·`[IO.File]::Write*` 등)만 잡는 휴리스틱이다
+  - **경고(비차단)**: 규칙 #8 — `src/tools`·`src/lib`에 console.log/error 호출 수가 **늘어나는** 편집 (CLI·setup·테스트 제외). `additionalContext`로 모델 컨텍스트에 들어간다
+  - LexDiff 수정이 정말 필요하면 **사용자 승인 후** `.claude/hooks/.allow-protected-edit`(사유 기재, gitignore 대상)를 만들면 1시간 해제된다. `fly deploy` 차단은 해제 수단이 없다
+  - 구성: `guard.mjs`(진입점) · `guard-rules.mjs`(판정) · `shell-rules.mjs`(Bash·PowerShell 분석) · `console-warning.mjs`. 회귀 테스트: `node --test .claude/hooks/guard.test.mjs`
+  - **Windows**: Claude Code는 Windows에서 PowerShell 도구를 주 셸로 쓰므로 matcher에 `PowerShell`이 필요하다. 훅은 exec form(`command: node` + `args`)이라 셸 없이 실행되고 `${CLAUDE_PROJECT_DIR}`는 Claude Code가 치환한다 — Git Bash 유무와 무관. `node.exe`가 PATH에 있어야 한다
+- hookify 경고(`systemMessage`)는 실측(2026-11) 결과 **모델 컨텍스트에 들어가지 않는다** — 모델이 알아야 하는 규칙은 hookify가 아니라 guard 쪽에 둘 것
+
 ## Key Files
 
 | 파일 | 역할 |

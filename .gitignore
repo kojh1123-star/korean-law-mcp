@@ -23,6 +23,8 @@ test-results-*.txt
 .claude/settings.local.json
 .claude/memory/
 .claude/plans/
+# 가드 훅 일시 해제 파일(사용자 승인 후 생성, 1시간 유효) — 커밋 금지
+.claude/hooks/.allow-protected-edit
 promo-video/
 *.tgz
 *.sqlite
