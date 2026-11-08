@@ -157,10 +157,12 @@ get_law_text(mst, jo="006300") → 제63조(휴직) 조회
 
 ### 가드 훅 (규칙 강제 장치)
 
-- **차단 (플러그인 불필요)**: `.claude/settings.json` → `.claude/hooks/guard.mjs` (PreToolUse). 규칙 #1의 LexDiff 이식 파일 3종 수정과, 이 레포에서의 `fly deploy`(gomdori-mcp 밖)를 exit 2로 막는다. Bash 검사는 흔한 쓰기 형태(`sed -i`·리다이렉트·`tee`·`cp`·`mv`·`rm` 등)만 잡는 휴리스틱이다
+- **가드 (플러그인 불필요)**: `.claude/settings.json` → `.claude/hooks/guard.mjs` (PreToolUse)
+  - **차단**: 규칙 #1의 LexDiff 이식 파일 3종 수정, 이 레포에서의 `fly deploy`(gomdori-mcp 밖) — exit 2. Bash 검사는 흔한 쓰기 형태(`sed -i`·리다이렉트·`tee`·`cp`·`mv`·`rm` 등)만 잡는 휴리스틱이다
+  - **경고(비차단)**: 규칙 #8 — `src/tools`·`src/lib`에 console.log/error 호출 수가 **늘어나는** 편집 (CLI·setup·테스트 제외). `additionalContext`로 모델 컨텍스트에 들어간다 (`console-warning.mjs`)
   - LexDiff 수정이 정말 필요하면 **사용자 승인 후** `.claude/hooks/.allow-protected-edit`(사유 기재, gitignore 대상)를 만들면 1시간 해제된다. `fly deploy` 차단은 해제 수단이 없다
   - 회귀 테스트: `node --test .claude/hooks/guard.test.mjs`
-- **경고 (hookify 플러그인 필요)**: `.claude/hookify.*.local.md` — 규칙 #8(console, `src/tools`·`src/lib`)과 `npm publish` 후 배포 순서 체크리스트. 클라우드 세션 유지를 위해 커밋한다. 실측(2026-11) 결과 hookify 경고는 **모델 컨텍스트에 들어가지 않는다** — 모델이 반드시 알아야 하는 규칙은 guard.mjs 쪽에 둘 것
+- **hookify (플러그인 필요)**: `.claude/hookify.*.local.md` — `npm publish` 후 배포 순서 체크리스트만 남았다. 실측(2026-11) 결과 hookify 경고(`systemMessage`)는 **모델 컨텍스트에 들어가지 않는다** — 모델이 반드시 알아야 하는 규칙은 guard.mjs 쪽에 둘 것
 
 ## Key Files
 

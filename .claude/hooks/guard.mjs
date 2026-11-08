@@ -1,16 +1,17 @@
 #!/usr/bin/env node
-// PreToolUse 가드 — CLAUDE.md 의 "절대 금지" 규칙을 모델의 기억이 아니라 시스템이 강제한다.
-// 등록: .claude/settings.json (hooks.PreToolUse). 플러그인 없이 이 레포를 여는 모든 Claude Code 환경에서 동작.
+// PreToolUse 가드 — CLAUDE.md 규칙을 모델 기억 대신 시스템이 강제. 등록: .claude/settings.json (플러그인 불필요).
 //
 // 1) LexDiff 이식 파일 수정 차단 (Critical Rules #1) — Edit/Write/MultiEdit + 흔한 Bash 쓰기 형태
 // 2) 이 레포에서 `fly deploy` 실행 차단 (배포 절) — gomdori-mcp 안에서 실행할 때만 허용
+// 3) src/tools·src/lib 의 console 추가 경고 (Critical Rules #8, 비차단) — console-warning.mjs
 //
-// 차단 = exit 2 + stderr(Claude 에게 차단 사유로 전달). 그 밖의 모든 경우(입력 파싱 실패 포함) exit 0 = 통과.
+// 차단 = exit 2 + stderr(Claude 에게 차단 사유). 경고 = exit 0 + stdout JSON additionalContext. 그 외(파싱 실패 포함) 통과.
 // Bash 검사는 휴리스틱이다: node -e / 스크립트 파일 경유 쓰기, git checkout·apply 등은 잡지 않는다.
 
 import { readFileSync, statSync } from "node:fs"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
+import { consoleWarning } from "./console-warning.mjs"
 
 export const PROTECTED_FILES = [
   "src/lib/search-normalizer.ts",
@@ -154,27 +155,45 @@ function checkBash(input, root, now) {
 }
 
 /** 훅 입력 → 차단 사유(문자열) 또는 null(통과). 테스트에서 직접 호출한다. */
+const resolveRoot = (input, root) => root || process.env.CLAUDE_PROJECT_DIR || input.cwd || process.cwd()
+
 export function evaluate(input, { root, now = Date.now() } = {}) {
   if (!input || typeof input !== "object") return null
-  const projectRoot = root || process.env.CLAUDE_PROJECT_DIR || input.cwd || process.cwd()
+  const projectRoot = resolveRoot(input, root)
   if (FILE_TOOLS.has(input.tool_name)) return checkFileTool(input, projectRoot, now)
   if (input.tool_name === "Bash") return checkBash(input, projectRoot, now)
   return null
 }
 
+/** 훅 입력 → Claude 에게 줄 비차단 경고(문자열) 또는 null. */
+export function advise(input, { root } = {}) {
+  if (!input || typeof input !== "object" || !FILE_TOOLS.has(input.tool_name)) return null
+  const projectRoot = resolveRoot(input, root)
+  const cwd = input.cwd || projectRoot
+  const filePath = input.tool_input?.file_path
+  const repoPath = toRepoPath(filePath, cwd, projectRoot)
+  return repoPath ? consoleWarning(input, repoPath, path.resolve(cwd, filePath)) : null
+}
+
+// process.exit() 대신 exitCode — macOS 파이프는 비동기 쓰기라 즉시 종료하면 메시지가 잘릴 수 있다.
 function main() {
   let input
   try {
     input = JSON.parse(readFileSync(0, "utf8"))
   } catch {
-    process.exit(0)
+    return
   }
   const reason = evaluate(input)
   if (reason) {
     process.stderr.write(`${reason}\n`)
-    process.exit(2)
+    process.exitCode = 2
+    return
   }
-  process.exit(0)
+  const warning = advise(input)
+  if (warning) {
+    const output = { hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext: warning } }
+    process.stdout.write(JSON.stringify(output))
+  }
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main()

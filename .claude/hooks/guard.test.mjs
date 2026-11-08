@@ -4,11 +4,13 @@ import assert from "node:assert/strict"
 import { mkdtempSync, mkdirSync, writeFileSync, utimesSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { evaluate, splitSegments, OVERRIDE_FILE } from "./guard.mjs"
+import { evaluate, advise, splitSegments, OVERRIDE_FILE } from "./guard.mjs"
 
 const root = mkdtempSync(path.join(tmpdir(), "guard-"))
 const bash = (command, cwd = root) => evaluate({ tool_name: "Bash", tool_input: { command }, cwd }, { root })
 const edit = (file_path, tool_name = "Edit") => evaluate({ tool_name, tool_input: { file_path }, cwd: root }, { root })
+const warn = (tool_name, tool_input) => advise({ tool_name, tool_input, cwd: root }, { root })
+const addLog = (file_path) => ({ file_path, old_string: "a", new_string: "console.log(a)" })
 
 test("LexDiff 이식 파일 Edit/Write/MultiEdit 차단", () => {
   assert.match(edit(path.join(root, "src/lib/law-parser.ts")), /LexDiff/)
@@ -76,4 +78,32 @@ test("입력이 비정상이면 통과", () => {
   assert.equal(evaluate(null, { root }), null)
   assert.equal(evaluate({ tool_name: "Read", tool_input: { file_path: "src/lib/law-parser.ts" } }, { root }), null)
   assert.equal(evaluate({ tool_name: "Edit", tool_input: {} }, { root }), null)
+  assert.equal(advise(null, { root }), null)
+  assert.equal(advise({ tool_name: "Bash", tool_input: { command: "echo console.log(1)" } }, { root }), null)
+})
+
+test("console 경고: src/tools·src/lib 에 console 을 추가하면 경고만 하고 차단하지 않는다", () => {
+  assert.match(warn("Edit", addLog("src/tools/law-text.ts")), /Critical Rules #8/)
+  assert.match(warn("Write", { file_path: "src/tools/scenarios/new.ts", content: "console.error(e)" }), /#8/)
+  const multi = { file_path: "src/lib/cache.ts", edits: [{ old_string: "a", new_string: "console.log(a)" }] }
+  assert.match(warn("MultiEdit", multi), /#8/)
+  assert.equal(evaluate({ tool_name: "Edit", tool_input: addLog("src/tools/law-text.ts"), cwd: root }, { root }), null)
+})
+
+test("console 경고 제외: 기존 호출 수정, CLI·setup·테스트·범위 밖 파일", () => {
+  const rewrite = { file_path: "src/tools/law-text.ts", old_string: "console.log(a)", new_string: "console.log(b)" }
+  assert.equal(warn("Edit", rewrite), null)
+  assert.equal(warn("Edit", addLog("src/lib/cli-format.ts")), null)
+  assert.equal(warn("Edit", addLog("src/cli.ts")), null)
+  assert.equal(warn("Edit", addLog("src/setup.ts")), null)
+  assert.equal(warn("Edit", addLog("src/lib/foo.test.ts")), null)
+  assert.equal(warn("Edit", addLog("scripts/x.ts")), null)
+})
+
+test("console 경고: Write 는 기존 파일보다 호출 수가 늘 때만", () => {
+  mkdirSync(path.join(root, "src/lib"), { recursive: true })
+  writeFileSync(path.join(root, "src/lib/existing.ts"), "console.error(x)\n")
+  const write = (content) => warn("Write", { file_path: "src/lib/existing.ts", content })
+  assert.equal(write("console.error(x)\nconst y = 1\n"), null)
+  assert.match(write("console.error(x)\nconsole.log(y)\n"), /#8/)
 })
