@@ -71,8 +71,8 @@
     "exceljs": "4.4.0",
     "express": "^5.2.1",
     "fast-xml-parser": "5.11.1",
-    "kordoc": "^4.7.2",
-    "multer": "2.4.0",
+    "kordoc": "4.24.25",
+    "multer": "2.5.0",
     "oidc-provider": "9.12.2",
     "pdfjs-dist": "4.10.38",
     "zod": "^4.0.0"
