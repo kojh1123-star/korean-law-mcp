@@ -1,3 +1,8 @@
 # Reviewed documentation-only hardcoding example, not an operational credential.
 # This excludes ONE historical finding, not this file, rule, or entire commit.
 821677f0ac3f8bd59cfd21c42176f513a82c9bed:docs/ARCHITECTURE.md:generic-api-key:952
+
+# Reviewed upstream test fixture (merged from chrisryugj/korean-law-mcp v4.15.9): a descriptive
+# dummy value ("argument-secret-…") used to prove tool output masks argument keys. Not a credential.
+# Excludes ONE historical finding only, not the file, rule, or commit.
+65a03ae3c7e1c2abc293960aa5f462b10a039cad:src/execution-output.review3.test.ts:generic-api-key:9
