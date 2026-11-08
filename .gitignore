@@ -25,7 +25,6 @@ test-results-*.txt
 .claude/plans/
 # 가드 훅 일시 해제 파일(사용자 승인 후 생성, 1시간 유효) — 커밋 금지
 .claude/hooks/.allow-protected-edit
-# hookify 규칙(.claude/hookify.*.local.md)은 hookify 권장과 달리 의도적으로 커밋한다 — 클라우드 세션은 매번 새로 클론되므로
 promo-video/
 *.tgz
 *.sqlite

@@ -1,13 +1,17 @@
-// guard.mjs 회귀 테스트 — 실행: node --test .claude/hooks/guard.test.mjs
+// 가드 훅 회귀 테스트 — 실행: node --test .claude/hooks/guard.test.mjs
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import { mkdtempSync, mkdirSync, writeFileSync, utimesSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { evaluate, advise, splitSegments, OVERRIDE_FILE } from "./guard.mjs"
+import { spawnSync } from "node:child_process"
+import { fileURLToPath } from "node:url"
+import { evaluate, advise, OVERRIDE_FILE } from "./guard-rules.mjs"
+import { splitSegments } from "./shell-rules.mjs"
 
 const root = mkdtempSync(path.join(tmpdir(), "guard-"))
 const bash = (command, cwd = root) => evaluate({ tool_name: "Bash", tool_input: { command }, cwd }, { root })
+const ps = (command, cwd = root) => evaluate({ tool_name: "PowerShell", tool_input: { command }, cwd }, { root })
 const edit = (file_path, tool_name = "Edit") => evaluate({ tool_name, tool_input: { file_path }, cwd: root }, { root })
 const warn = (tool_name, tool_input) => advise({ tool_name, tool_input, cwd: root }, { root })
 const addLog = (file_path) => ({ file_path, old_string: "a", new_string: "console.log(a)" })
@@ -56,6 +60,58 @@ test("fly 문자열을 검색·출력만 하는 명령은 통과", () => {
   assert.equal(bash('grep -rn "fly deploy" docs/'), null)
   assert.equal(bash("fly releases -a korean-law-mcp"), null)
   assert.equal(bash("echo 'fly deploy 금지'"), null)
+})
+
+test("PowerShell 쓰기 형태 차단 (Windows 에서 Claude 의 주 셸)", () => {
+  assert.match(ps("Set-Content -Path src/lib/law-parser.ts -Value x"), /LexDiff/)
+  assert.match(ps("'x' | Out-File src\\lib\\law-parser.ts"), /LexDiff/)
+  assert.match(ps("Copy-Item C:/tmp/new.ts -Destination src/lib/search-normalizer.ts"), /LexDiff/)
+  assert.match(ps("Remove-Item src/lib/citation-content-matcher.ts"), /LexDiff/)
+  assert.match(ps("[IO.File]::WriteAllText('src/lib/law-parser.ts', 'x')"), /LexDiff/)
+  assert.match(ps("echo x > src/lib/law-parser.ts"), /LexDiff/)
+})
+
+test("PowerShell 읽기 형태는 통과", () => {
+  assert.equal(ps("Get-Content src/lib/law-parser.ts"), null)
+  assert.equal(ps("Copy-Item src/lib/law-parser.ts -Destination C:/tmp/x.ts"), null)
+  assert.equal(ps("Select-String -Path src/lib/law-parser.ts -Pattern jo"), null)
+  assert.equal(ps('Select-String "fly deploy" CLAUDE.md'), null)
+})
+
+test("PowerShell fly deploy: 호출 연산자·.exe 포함 차단, gomdori-mcp 이동 후 통과", () => {
+  assert.match(ps("fly deploy"), /fly deploy/)
+  assert.match(ps("& fly deploy"), /fly deploy/)
+  assert.match(ps("flyctl.exe deploy -a korean-law-mcp"), /fly deploy/)
+  assert.equal(ps("Set-Location ~/workspace/gomdori-mcp; fly deploy -c fly.production.toml"), null)
+})
+
+test("Windows 경로: 역슬래시·드라이브 문자 대소문자와 무관하게 판정", () => {
+  const winRoot = "C:\\work\\korean-law-mcp"
+  const winEdit = (file_path) => evaluate({ tool_name: "Edit", tool_input: { file_path }, cwd: winRoot }, { root: winRoot })
+  assert.match(winEdit("C:\\work\\korean-law-mcp\\src\\lib\\law-parser.ts"), /LexDiff/)
+  assert.match(winEdit("c:\\WORK\\Korean-Law-MCP\\src\\lib\\law-parser.ts"), /LexDiff/)
+  assert.match(winEdit("src/lib/search-normalizer.ts"), /LexDiff/)
+  assert.equal(winEdit("C:\\work\\korean-law-mcp\\src\\lib\\query-router.ts"), null)
+  assert.equal(winEdit("D:\\other\\src\\lib\\law-parser.ts"), null)
+  const winPs = (command) => evaluate({ tool_name: "PowerShell", tool_input: { command }, cwd: winRoot }, { root: winRoot })
+  assert.match(winPs("Set-Content src\\lib\\law-parser.ts x"), /LexDiff/)
+  assert.match(winPs("fly deploy"), /fly deploy/)
+  const gomdori = "C:\\Users\\me\\workspace\\gomdori-mcp"
+  const inGomdori = evaluate({ tool_name: "PowerShell", tool_input: { command: "fly deploy" }, cwd: gomdori }, { root: winRoot })
+  assert.equal(inGomdori, null)
+})
+
+test("진입점(guard.mjs): stdin → 종료 코드·출력 계약", () => {
+  const entry = fileURLToPath(new URL("./guard.mjs", import.meta.url))
+  const run = (payload) => spawnSync(process.execPath, [entry], { input: payload, encoding: "utf8", env: { ...process.env, CLAUDE_PROJECT_DIR: root } })
+  const blocked = run(JSON.stringify({ tool_name: "Bash", tool_input: { command: "fly deploy" }, cwd: root }))
+  assert.equal(blocked.status, 2)
+  assert.match(blocked.stderr, /fly deploy/)
+  const warned = run(JSON.stringify({ tool_name: "Edit", tool_input: addLog(path.join(root, "src/tools/x.ts")), cwd: root }))
+  assert.equal(warned.status, 0)
+  assert.match(JSON.parse(warned.stdout).hookSpecificOutput.additionalContext, /#8/)
+  assert.equal(run("not json").status, 0)
+  assert.equal(run(JSON.stringify({ tool_name: "Bash", tool_input: { command: "ls" }, cwd: root })).stdout, "")
 })
 
 test("승인 해제 파일: 1시간 안에는 LexDiff 차단 해제, fly deploy 는 계속 차단", () => {
