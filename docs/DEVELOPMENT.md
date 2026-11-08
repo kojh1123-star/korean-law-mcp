@@ -210,12 +210,11 @@ Conventional Commits:
 ```bash
 npm version patch  # 버전 bump
 git push --follow-tags
-gh release create v$(node -p 'require("./package.json").version') --generate-notes
+npm publish        # 로컬 게시가 정규 경로 (2FA)
+npm view korean-law-mcp version  # 새 버전을 반환할 때까지 대기 — npm 전파
 ```
 
-GitHub Release가 `.github/workflows/publish.yml`을 실행합니다. workflow는 OIDC로 게시하고 provenance attestation을 자동 생성합니다.
-
-> ⚠️ **선행 조건 (2026-08-16 기준 미완료)**: npm 패키지 설정에서 이 저장소와 `publish.yml`을 trusted publisher로 등록해야 이 workflow 가 성공한다. 등록 전까지는 종전대로 로컬 `npm publish`(2FA)를 쓰고 GitHub Release 는 만들지 않는다 — 등록 없이 Release 를 만들면 publish job 이 인증 단계에서 실패한다.
+> ⚠️ `.github/workflows/publish.yml`(GitHub Release → OIDC trusted publishing + provenance)은 **npm 쪽 trusted publisher 등록이 아직 안 됐다**. 그래서 게시는 위 로컬 `npm publish`가 정규 경로이고, GitHub Release는 게시 뒤 통합 호스트 배포까지 마친 다음에 만든다(아래 반영 절차 6). 워크플로는 같은 버전이 이미 레지스트리에 있으면 게시를 건너뛰고 검증(typecheck·test·build·verify:package·audit)만 릴리스 시점에 재확인한다.
 
 ### 통합 호스트 (프로덕션)
 
@@ -227,11 +226,17 @@ GitHub Release가 `.github/workflows/publish.yml`을 실행합니다. workflow�
 반영 절차:
 
 ```bash
-# 1) 이 레포 커밋·푸시 → 2) npm publish
-# 3) ~/workspace/gomdori-mcp/Dockerfile 의 korean-law-mcp@X.Y.Z 핀 갱신
-# 4) cd ~/workspace/gomdori-mcp && fly deploy -c fly.production.toml
+# 1) 이 레포 커밋·푸시
+# 2) npm publish
+# 3) npm 전파 대기 — npm view korean-law-mcp version 이 새 버전을 반환할 때까지 (보통 30초 안쪽)
+#    전파 전에 배포하면 이미지가 옛 버전을 설치한다
+# 4) ~/workspace/gomdori-mcp/Dockerfile 의 korean-law-mcp@X.Y.Z 핀 갱신
+# 5) cd ~/workspace/gomdori-mcp && fly deploy -c fly.production.toml
+# 6) gh release create vX.Y.Z  — 노트 본문은 CHANGELOG.md 의 해당 버전 절을 옮긴다
+# 7) gomdori-mcp/scripts/verify-deploy.sh 로 사용자 경로 반영 확인
 ```
 
+- **릴리스는 배포와 항상 같이 간다** — npm 게시만 하고 Release를 빠뜨리면 이 레포의 릴리스 이력에 구멍이 남는다(v4.10.0·v4.11.0이 그렇게 비었다가 2026-08-17에 소급 생성됐다).
 - 공식 주소: `https://mcp.gomdori.app/law` (구 `korean-law-mcp.fly.dev/mcp`는 하위호환 유지)
 
 ### Docker (자체 호스팅)
