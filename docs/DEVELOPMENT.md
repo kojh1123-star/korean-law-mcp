@@ -205,34 +205,10 @@ Conventional Commits:
 
 ## 배포
 
-### npm
+이 포크(kojh1123-star/korean-law-mcp)는 별도 배포 대상이 없다 — gomdori-mcp 통합 호스트·Railway·npm 게시를 쓰지 않는다(npm 패키지 `korean-law-mcp` 게시 권한은 업스트림에만 있다).
 
-```bash
-npm version patch  # 버전 bump
-git push --follow-tags
-gh release create v$(node -p 'require("./package.json").version') --generate-notes
-```
-
-GitHub Release가 `.github/workflows/publish.yml`을 실행합니다. workflow는 OIDC로 게시하고 provenance attestation을 자동 생성합니다.
-
-> ⚠️ **선행 조건 (2026-08-16 기준 미완료)**: npm 패키지 설정에서 이 저장소와 `publish.yml`을 trusted publisher로 등록해야 이 workflow 가 성공한다. 등록 전까지는 종전대로 로컬 `npm publish`(2FA)를 쓰고 GitHub Release 는 만들지 않는다 — 등록 없이 Release 를 만들면 publish job 이 인증 단계에서 실패한다.
-
-### 통합 호스트 (프로덕션)
-
-> 🚫 **이 레포에서 `fly deploy`/`flyctl deploy` 직접 실행 절대 금지.**
-> 프로덕션은 이 레포가 아니라 [gomdori-mcp](https://github.com/chrisryugj/gomdori-mcp) 통합
-> 호스트(fly 앱 `korean-law-mcp` 1대에 MCP 5종 동거)가 서빙한다. 여기서 배포하면 통합 이미지를
-> law 단독 이미지로 덮어써 stats·patent·archhub·school까지 전부 죽는다. 배경: [FLY-COST.md](FLY-COST.md)
-
-반영 절차:
-
-```bash
-# 1) 이 레포 커밋·푸시 → 2) npm publish
-# 3) ~/workspace/gomdori-mcp/Dockerfile 의 korean-law-mcp@X.Y.Z 핀 갱신
-# 4) cd ~/workspace/gomdori-mcp && fly deploy -c fly.production.toml
-```
-
-- 공식 주소: `https://mcp.gomdori.app/law` (구 `korean-law-mcp.fly.dev/mcp`는 하위호환 유지)
+- **반영 절차**: 이 레포 커밋·푸시까지가 전부다.
+- fly는 쓰지 않는다 — 이 레포에서 `fly deploy`를 실행하지 않는다.
 
 ### Docker (자체 호스팅)
 

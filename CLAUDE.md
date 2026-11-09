@@ -1,14 +1,10 @@
 # CLAUDE.md
 
-> ## ⚠️ 배포 — 통합 호스트 (2026-07-02부터)
+> ## ⚠️ 배포
 >
-> 프로덕션은 이 레포가 아니라 **[gomdori-mcp](https://github.com/chrisryugj/gomdori-mcp) 통합 호스트**(fly 앱 `korean-law-mcp` 1대, MCP 5종 동거)가 서빙한다.
-> - 공식 주소: `https://mcp.gomdori.app/law` (구 `korean-law-mcp.fly.dev/mcp`는 하위호환으로 유지)
-> - **반영 절차**: 이 레포 커밋·푸시 → `npm publish` → **npm 전파 대기**(`npm view korean-law-mcp version`이 새 버전을 반환할 때까지 — 보통 30초 안쪽. 전파 전에 배포하면 이미지가 옛 버전을 설치한다) → `~/workspace/gomdori-mcp/Dockerfile`의 `korean-law-mcp@X.Y.Z` 핀 갱신 → `cd ~/workspace/gomdori-mcp && fly deploy -c fly.production.toml` → **GitHub Release 생성**(`gh release create vX.Y.Z`) → `gomdori-mcp/scripts/verify-deploy.sh` 로 사용자 경로 반영 확인
->   - **MCP 레지스트리**: 릴리스 뒤 `mcp-publisher publish` (registry.modelcontextprotocol.io, `io.github.chrisryugj/korean-law-mcp`). `server.json`·`.claude-plugin/plugin.json`·`marketplace.json` version 과 plugin.json 의 npx 고정 버전(`korean-law-mcp@X.Y.Z`, Claude 디렉터리는 `@latest` 를 차단)은 package.json 과 같아야 하며 `verify:package` 가 막는다
->   - **릴리스는 배포와 항상 같이 간다** — npm 게시만 하고 Release 를 빠뜨리면 이 레포의 릴리스 이력에 구멍이 남는다(v4.10.0·v4.11.0 이 그렇게 비었다가 2026-08-17 에 소급 생성됐다). 노트 본문은 CHANGELOG 의 해당 절을 옮긴다.
->   - `.github/workflows/publish.yml`(GitHub Release → OIDC trusted publishing + provenance)은 **npm 쪽 trusted publisher 등록이 아직 안 됐다**. 그래서 게시는 위 로컬 `npm publish` 가 정규 경로이고, Release 는 그 뒤에 만든다 — 워크플로는 같은 버전이 이미 레지스트리에 있으면 게시를 건너뛰고 검증(typecheck·test·build·verify:package·audit)만 릴리스 시점에 재확인한다.
-> - **🚫 이 레포에서 `fly deploy` 직접 실행 절대 금지** — 통합 이미지를 law 단독 이미지로 덮어써 stats·patent·archhub·school까지 전부 죽는다. 자세한 배경: [docs/FLY-COST.md](docs/FLY-COST.md)
+> 이 포크(kojh1123-star/korean-law-mcp)는 별도 배포 대상이 없다 — gomdori-mcp 통합 호스트·Railway·npm 게시를 쓰지 않는다(npm 패키지 `korean-law-mcp` 게시 권한은 업스트림에만 있다).
+> - **반영 절차**: 이 레포 커밋·푸시까지가 전부다.
+> - fly는 쓰지 않는다 — 이 레포에서 `fly deploy`를 실행하지 않는다.
 
 Korean Law MCP Server v4.15.9 - 법제처 42개 API → 10개 통합 도구 (내부 99개) + 9개 시나리오 + 자연어 CLI + HTTP stateless + 판례 토큰 74% 감축 + **legal_research (체인 8종 통합, task 파라미터)** + **legal_analysis (인용검증·판례생사·행위시법·영향그래프 통합, mode 파라미터)** + **time_travel (시점 diff)** + **action_plan (이럴 땐 이렇게, 5단계 안내)** + **시행예정 감지 (search_law가 제명변경·미시행 개정 자동 병기)** + **ordinance_radar (조례 정비 레이더 — 근거 상위법 개정 자동 대조, v4.7.0)** + **인용 검증 표기 내성 (낫표·가운뎃점·`같은 법` 조응, v4.9.0)** + **폐지 감지 (검색 0건 시 폐지 법령·행정규칙 연혁 추적 — 폐지사유·후속 통합 규정 자동 안내, v4.10.0)** + **search_law_bulk (등록부 대량 조회 + MST diff 감시, v4.13.0)** + **행정규칙 부분 조회 (get_admin_rule 의 jo·chapter·keyword·page — 통짜 전문을 조문 단위로, v4.14.0)** + **법령ID 계보 연혁 (제명이 바뀌기 전 버전까지 — search_historical_law·applicable_law·time_travel, get_annexes date 시점 별표, get_law_text efYd 기준일 보정, 행정규칙 기준일 판단, v4.15.0)**
 
