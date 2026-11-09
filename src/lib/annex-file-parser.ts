@@ -8,7 +8,8 @@
  * @see https://github.com/chrisryugj/kordoc
  */
 
-import { parse } from "kordoc"
+// kordoc 은 별표 파일을 실제로 파싱할 때만 불러온다. 정적 import 면 기동 즉시 RSS 가
+// 27MB 늘어난다(로컬 실측). 5종이 1GB 를 나눠 쓰는 통합 호스트에선 큰 몫이다.
 import type { ParseResult, FileType } from "kordoc"
 
 // ─── 기존 인터페이스 호환 ────────────────────────────
@@ -27,7 +28,9 @@ export interface AnnexParseResult {
 // ─── 메인 엔트리 ─────────────────────────────────────
 
 export async function parseAnnexFile(buffer: ArrayBuffer): Promise<AnnexParseResult> {
-  const result: ParseResult = await parse(buffer)
+  const { parse } = await import("kordoc")
+  // kordoc 4.17 은 OCR 모델이 캐시에 있으면 PDF 를 자동 OCR 한다 — 모델 유무로 결과·시간(파일당 최대 7초)이 갈리지 않게 끈다
+  const result: ParseResult = await parse(buffer, { ocr: false })
 
   if (result.success) {
     return {

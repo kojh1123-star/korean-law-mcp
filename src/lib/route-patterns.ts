@@ -19,7 +19,7 @@ import {
   isRegionToken,
 } from "./query-extract.js"
 import { ROUTABLE_SCENARIO_RULES } from "./scenario-rules.js"
-import { CASE_CODE_PATTERN } from "./case-citation.js"
+import { CASE_CODE_PATTERN, CASE_SERIAL_PATTERN } from "./case-citation.js"
 
 export interface Pattern {
   /** 패턴 이름 */
@@ -46,7 +46,7 @@ export interface Pattern {
 // `[가-힣]{1,5}` 와일드카드는 "2023년 5월"의 `년`을 부호로 읽었고, 어순마다 덧댄
 // `(?!년|월|일)` 가드는 한쪽에만 있었다. 실재 부호만 받으면 가드가 필요 없다.
 // COURT_CASE_PATTERN 은 연도 4자리 전용이라 "96누4671" 표기를 놓쳐 쓰지 않는다.
-const CASE_NO_SRC = `(?<![\\d제])\\d{2,4}\\s*${CASE_CODE_PATTERN}\\s*\\d{1,8}`
+const CASE_NO_SRC = `(?<![\\d제])\\d{2,4}\\s*${CASE_CODE_PATTERN}\\s*${CASE_SERIAL_PATTERN}`
 const CASE_NO_RE = new RegExp(CASE_NO_SRC)
 /** cite_check 트리거 어휘 — 두 어순이 같은 목록을 본다 */
 const CITE_CHECK_KEYWORDS = "유효|살아|변경|폐기|뒤집|생사|추적|아직|citator"
@@ -92,7 +92,7 @@ const routePatterns: Pattern[] = [
       "impact_map", "applicable_law", "verify_citations", "cite_check",
       "law_system", "law_comparison", "amendment", "precedent",
       "annex", "law_tree", "constitutional", "english_law",
-      "interpretation", "nts_interpretation", "contract_review",
+      "interpretation", "nts_interpretation", "moel_interpretation", "insurance_review", "contract_review",
       "scenario_time_travel",
     ],
     extract: (query) => {
@@ -414,6 +414,47 @@ const routePatterns: Pattern[] = [
       return { domain: "nts", query: cleaned || query }
     },
     reason: "국세청 해석 키워드 → search_decisions(domain=nts) — 국세청 직접 회신 해석례",
+    priority: 3,
+  },
+
+  // ── 19-2. 고용노동부 법령해석(질의회시) ──
+  // 법제처 해석례(interpretation, priority 10)는 법제처 회신이라 고용노동부 질의회시와 다른 DB다.
+  // 노동부·질의회시를 명시한 질의만 moel 로 보낸다 (일반 "해석례"는 기존대로 interpretation)
+  {
+    name: "moel_interpretation",
+    patterns: [
+      /(?:고용\s*)?노동부\s*(?:행정\s*|법령\s*)?(?:해석|질의|회시|회신)/,
+      /질의\s*회시/,
+    ],
+    tool: "search_decisions",
+    extract: (query) => {
+      const cleaned = query
+        .replace(/고용\s*노동부|노동부|법령\s*해석|행정\s*해석|해석례?|질의\s*회시|질의|회시|회신/g, "")
+        .replace(/\s+/g, " ")
+        .trim()
+      return { domain: "moel", query: cleaned || query }
+    },
+    reason: "고용노동부 해석 키워드 → search_decisions(domain=moel) — 고용노동부 질의회시",
+    priority: 3,
+  },
+
+  // ── 19-3. 산재보험·고용보험 재심사 재결 ──
+  {
+    name: "insurance_review",
+    patterns: [
+      /산재\s*(?:보험\s*)?재심사|산업재해\s*보상\s*보험\s*재심사/,
+      /고용\s*보험\s*(?:재\s*)?심사\s*위원회|고용\s*보험\s*재심사/,
+    ],
+    tool: "search_decisions",
+    extract: (query) => {
+      const domain = /고용\s*보험/.test(query) && !/산재|산업재해/.test(query) ? "eiac" : "iaciac"
+      const cleaned = query
+        .replace(/산업재해\s*보상\s*보험|산재\s*보험|산재|고용\s*보험|재\s*심사|심사|위원회|재결례?|결정(?:례|문)?/g, "")
+        .replace(/\s+/g, " ")
+        .trim()
+      return cleaned ? { domain, query: cleaned } : { domain }
+    },
+    reason: "산재·고용보험 재심사 키워드 → search_decisions(domain=iaciac|eiac) — 재심사위원회 재결",
     priority: 3,
   },
 

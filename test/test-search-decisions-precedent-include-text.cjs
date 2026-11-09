@@ -126,8 +126,17 @@ async function testIncludeTextPassesPrecedentOptionsToSearch() {
 }
 
 async function main() {
+  // 같은 ID의 판례 fixture를 바꾸는 시나리오마다 전용 판례 캐시도 비운다
+  const { lawCache } = await import("../build/lib/cache.js")
+  const { precedentCache } = await import("../build/tools/precedents.js")
+  lawCache.clear()
+  precedentCache.clear()
   await testDefaultPrecedentSearchRemainsListOnly()
+  lawCache.clear()
+  precedentCache.clear()
   await testIncludeTextFetchesBoundedPrecedentDetails()
+  lawCache.clear()
+  precedentCache.clear()
   await testIncludeTextPassesPrecedentOptionsToSearch()
   console.log("search_decisions precedent includeText tests passed")
 }

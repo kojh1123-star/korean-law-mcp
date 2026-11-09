@@ -161,10 +161,21 @@ async function testDocumentReviewSurvivesPrecedentSearchFailure(chainDocumentRev
 }
 
 async function main() {
+  // 같은 ID의 판례 fixture를 바꾸는 시나리오마다 전용 판례 캐시도 비운다
+  const { lawCache } = await import("../build/lib/cache.js")
+  const { precedentCache } = await import("../build/tools/precedents.js")
   const { chainFullResearch, chainDocumentReview } = await import("../build/tools/chains.js")
+  lawCache.clear()
+  precedentCache.clear()
   await testChainFullResearchFetchesTopTwoPrecedentDetails(chainFullResearch)
+  lawCache.clear()
+  precedentCache.clear()
   await testChainFullResearchSurvivesPrecedentSearchFailure(chainFullResearch)
+  lawCache.clear()
+  precedentCache.clear()
   await testDocumentReviewFetchesTopTwoPrecedentDetailsTotal(chainDocumentReview)
+  lawCache.clear()
+  precedentCache.clear()
   await testDocumentReviewSurvivesPrecedentSearchFailure(chainDocumentReview)
   console.log("chain search detail integration tests passed")
 }

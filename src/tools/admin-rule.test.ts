@@ -2,6 +2,9 @@ import { describe, it, expect } from "vitest"
 import { searchAdminRule, getAdminRule, compareAdminRuleOldNew } from "./admin-rule.js"
 import { extractDetailIds } from "./search-detail-chain.js"
 import type { LawApiClient } from "../lib/api-client.js"
+import { INLINE_IMAGE_MARK } from "../lib/image-only-body.js"
+import { ExecutionLimitError, RequestExecutionBudget, DEFAULT_EXECUTION_LIMITS } from "../lib/execution-limits.js"
+import { requestContext } from "../lib/session-state.js"
 
 // 실측 응답 축약 (#72).
 // lawService.do?target=admrul&ID= 가 받는 값은 '행정규칙일련번호'(13자리)다.
@@ -85,5 +88,271 @@ describe("compare_admin_rule_old_new — 실형상 파싱", () => {
   it("본문: <신  설> 같은 꺾쇠 표기를 태그로 오인해 지우지 않는다", async () => {
     const r = await compareAdminRuleOldNew(fetchStub(OLDNEW_DETAIL_XML), { id: "2100000279208" })
     expect(r.content[0].text).toContain("[개정 전] 【<신  설>】")
+  })
+})
+
+// 실측 축약 (#159): 조문내용이 <img> 태그뿐이라 "비어 있음" 분기에 걸리지 않고,
+// 첨부파일(원문 hwpx/pdf)이 있는데도 안내되지 않던 응답
+const IMAGE_ONLY_XML = `<?xml version="1.0" encoding="UTF-8"?><AdmRulService><행정규칙기본정보><행정규칙일련번호>2100000248042</행정규칙일련번호><행정규칙명><![CDATA[(낙동강유역환경청) 수질오염물질의 배출허용기준 중 별도배출허용기준]]></행정규칙명><행정규칙종류>고시</행정규칙종류><조문형식여부>N</조문형식여부></행정규칙기본정보>
+<조문내용><![CDATA[(단위: ㎎/ℓ)
+<img id="144740515">
+</img>
+<img id="144740517">
+</img>]]></조문내용>
+<첨부파일><첨부파일명><![CDATA[별도배출허용기준 지정·고시.pdf]]></첨부파일명><첨부파일링크>http://law.go.kr/flDownload.do?flSeq=144740485
+</첨부파일링크></첨부파일></AdmRulService>`
+
+describe("get_admin_rule — 이미지-only 별표 경고 (#159)", () => {
+  it("본문이 <img>뿐이면 경고·원문 URL·첨부파일을 앞세운다", async () => {
+    const r = await getAdminRule(detailStub(IMAGE_ONLY_XML), { id: "2100000248042" })
+    expect(r.isError).toBeFalsy()
+    const text = r.content[0].text
+    expect(text).toContain("이미지로만 제공되어 텍스트 추출 불가")
+    expect(text).toContain("admRulSeq=2100000248042")
+    // 첨부파일 링크는 API가 이미 주고 있었는데 "본문이 비어 있지 않다"는 이유로 묻혀 있었다
+    expect(text).toContain("flSeq=144740485")
+    // 경고가 본문보다 앞 — truncate에 잘려 사라지면 안 된다
+    // 본문의 이미지 태그는 v4.15.0 부터 표식으로 바뀐다
+    expect(text).not.toContain("<img")
+    expect(text.indexOf("텍스트 추출 불가")).toBeLessThan(text.indexOf(INLINE_IMAGE_MARK))
+  })
+
+  it("텍스트 본문 사이에 박힌 이미지 표는 표식과 원문 안내로 바꾼다 (화재안전기준 표시온도 표)", async () => {
+    const MIXED_XML = IMAGE_ONLY_XML.replace("<조문내용><![CDATA[", `<조문내용><![CDATA[제10조(헤드) ⑥ 폐쇄형스프링클러헤드는 그 설치장소의 평상시 최고 주위온도에 따라 다음 표에 따른 표시온도의 것으로 설치하여야 한다. 다만, 높이가 4m 이상인 공장 및 창고에 설치하는 스프링클러헤드는 표시온도 121℃ 이상의 것으로 할 수 있다.\n`)
+    const text = (await getAdminRule(detailStub(MIXED_XML), { id: "2100000011921" })).content[0].text
+    expect(text).not.toContain("<img")
+    expect(text).toContain(INLINE_IMAGE_MARK)
+    expect(text).toContain("admRulSeq=2100000011921")
+  })
+
+  it("정상 조문에는 경고를 붙이지 않는다", async () => {
+    const r = await getAdminRule(detailStub(DETAIL_XML), { id: "2100000271110" })
+    expect(r.content[0].text).not.toContain("이미지로만 제공되어")
+  })
+})
+
+// ─── 부분 조회 (jo·chapter·keyword·page) + 캐시 + 제·개정이유 폴백 ───
+// 외국환거래규정 실측 형상 축약: 조문내용이 "통짜 1개"로 오는 하이픈형 규칙
+import { adminRuleXmlCache, adminRuleCacheKey, ADMIN_RULE_CACHE_TTL_MS } from "../lib/admin-rule-views.js"
+import { beforeEach, vi } from "vitest"
+import { DOMParser } from "@xmldom/xmldom"
+
+const HYPHEN_BLOB = [
+  "제1장 총칙",
+  "제1-1조(목적) 이 규정은 「외국환거래법」에서 위임된 사항을 정함을 목적으로 한다.",
+  "제2장 외국환업무취급기관 등",
+  "제2-6조의2 (예금 및 신탁)",
+  " ① 예금계정의 종류는 다음과 같다.",
+  "제9장 직접투자 및 부동산 취득",
+  "제9-5조(해외직접투자의 신고 등)",
+  " ① 거주자가 해외직접투자를 하고자 하는 경우 신고하여야 한다.",
+  "제9-9조(사후관리)",
+  " ① 해외직접투자자는 연간사업실적보고서를 제출하여야 한다.",
+].join("\n")
+
+const FX_RULE_XML = `<?xml version="1.0" encoding="UTF-8"?><AdmRulService><행정규칙기본정보><행정규칙일련번호>2100000285140</행정규칙일련번호><행정규칙명><![CDATA[외국환거래규정]]></행정규칙명><행정규칙종류>고시</행정규칙종류><발령일자>20260916</발령일자><발령번호>2026-103</발령번호><조문형식여부>N</조문형식여부></행정규칙기본정보>
+<조문내용><![CDATA[${HYPHEN_BLOB}]]></조문내용>
+<부칙공포일자>20260916</부칙공포일자><부칙내용><![CDATA[부칙 <제2026-103호, 2026. 9. 16.> 이 규정은 고시한 날부터 시행한다.]]></부칙내용></AdmRulService>`
+
+// 항목식 훈령 (조문 체계 없음)
+const ITEMIZED_XML = `<?xml version="1.0" encoding="UTF-8"?><AdmRulService><행정규칙기본정보><행정규칙명><![CDATA[항목식 지침]]></행정규칙명><조문형식여부>N</조문형식여부></행정규칙기본정보>
+<조문내용><![CDATA[1. 일반 원칙
+  가. 성실히 수행한다.
+2. 세부 지침]]></조문내용></AdmRulService>`
+
+// 신구대조 없음 + 제개정이유 있음 (T2 폴백)
+const OLDNEW_EMPTY_XML = `<?xml version="1.0" encoding="UTF-8"?><AdmRulOldAndNewService></AdmRulOldAndNewService>`
+const FX_RULE_WITH_REASON_XML = FX_RULE_XML.replace("</AdmRulService>",
+  `<제개정이유><제개정이유내용><![CDATA[◇ 개정이유]]><![CDATA[  원화 국제화 로드맵에 따라 해외원화업무취급기관 관련 사항을 정비함]]></제개정이유내용></제개정이유></AdmRulService>`)
+
+beforeEach(() => adminRuleXmlCache.clear())
+
+describe("get_admin_rule — 부분 조회 (T1)", () => {
+  it("jo:'제9-5조' → 해당 조문 전체, 제1~2장 내용 미포함, 첫머리에 규칙명·공포일 (AC#1)", async () => {
+    const r = await getAdminRule(detailStub(FX_RULE_XML), { id: "2100000285140", jo: "제9-5조" })
+    const text = r.content[0].text
+    expect(r.isError).toBeFalsy()
+    expect(text.startsWith("행정규칙명: 외국환거래규정")).toBe(true)
+    expect(text).toContain("공포일: 2026.09.16")
+    expect(text).toContain("제9-5조(해외직접투자의 신고 등)")
+    expect(text).toContain("신고하여야 한다")
+    expect(text).not.toContain("제1-1조")
+    expect(text).not.toContain("제2-6조의2")
+    expect(text).not.toContain("잘렸습니다")
+  })
+
+  it("jo:'9-9' 정규화 (AC#2)", async () => {
+    const r = await getAdminRule(detailStub(FX_RULE_XML), { id: "2100000285140", jo: "9-9" })
+    expect(r.content[0].text).toContain("제9-9조(사후관리)")
+  })
+
+  it("jo:'제2-6조의2' — 조의N + 하이픈 병용 (AC#3)", async () => {
+    const r = await getAdminRule(detailStub(FX_RULE_XML), { id: "2100000285140", jo: "제2-6조의2" })
+    expect(r.content[0].text).toContain("제2-6조의2 (예금 및 신탁)")
+  })
+
+  it("chapter:'제9장' → 제9장 조문 전부, 다음 장 미포함 (AC#4)", async () => {
+    const r = await getAdminRule(detailStub(FX_RULE_XML), { id: "2100000285140", chapter: "제9장" })
+    const text = r.content[0].text
+    expect(text).toContain("제9-5조")
+    expect(text).toContain("제9-9조")
+    expect(text).not.toContain("제1-1조")
+  })
+
+  it("keyword:'해외직접투자' → 관련 조문 목록 (AC#5)", async () => {
+    const r = await getAdminRule(detailStub(FX_RULE_XML), { id: "2100000285140", keyword: "해외직접투자" })
+    const text = r.content[0].text
+    expect(text).toContain("제9-5조")
+    expect(text).toContain("제9-9조")
+    expect(text).not.toContain("제1-1조(목적)")
+  })
+
+  it("page: 청크가 겹치지 않고 total_pages를 표기한다 (AC#6)", async () => {
+    const p1 = await getAdminRule(detailStub(FX_RULE_XML), { id: "2100000285140", page: 1 })
+    expect(p1.content[0].text).toMatch(/페이지 1\/\d+/)
+  })
+
+  it("조문 체계 없는 규칙에 jo 요청 → graceful 안내, 에러 아님 (AC#7)", async () => {
+    const r = await getAdminRule(detailStub(ITEMIZED_XML), { id: "2100000000001", jo: "제1조" })
+    expect(r.isError).toBeFalsy()
+    expect(r.content[0].text).toContain("조문 체계가 없습니다")
+    expect(r.content[0].text).toContain("keyword 또는 page")
+  })
+
+  it("복수 파라미터 → jo만 적용하고 무시 목록을 명시한다", async () => {
+    const r = await getAdminRule(detailStub(FX_RULE_XML), { id: "2100000285140", jo: "제9-5조", keyword: "예금", page: 3 })
+    const text = r.content[0].text
+    expect(text).toContain("'jo'만 적용")
+    expect(text).toContain("제9-5조")
+  })
+
+  it("없는 조문은 NOT_FOUND + 수록 범위 안내 (추측 금지)", async () => {
+    const r = await getAdminRule(detailStub(FX_RULE_XML), { id: "2100000285140", jo: "제99-1조" })
+    expect(r.isError).toBe(true)
+    expect(r.content[0].text).toContain("[NOT_FOUND]")
+    expect(r.content[0].text).toContain("추측/생성하지 마세요")
+  })
+
+  it("전문 응답을 캐시해 연속 부분 조회 시 API를 재호출하지 않는다", async () => {
+    let calls = 0
+    const counting = { getAdminRule: async () => { calls++; return FX_RULE_XML } } as unknown as LawApiClient
+    await getAdminRule(counting, { id: "2100000285140", jo: "제9-5조" })
+    await getAdminRule(counting, { id: "2100000285140", keyword: "해외직접투자" })
+    await getAdminRule(counting, { id: "2100000285140", page: 1 })
+    expect(calls).toBe(1)
+  })
+
+  it("keyword 가 조문에 없고 부칙·별표에 있으면 그 블록을 보여 준다 (NOT_FOUND 단정 금지)", async () => {
+    const withAnnex = FX_RULE_XML.replace("</AdmRulService>",
+      `<별표><별표단위 별표키="000201"><별표번호>0002</별표번호><별표제목><![CDATA[외국환업무등록신청서]]></별표제목><별표내용><![CDATA[┃⑧인 력 현 황 │임  원 │외국환전문요원  명 ┃]]></별표내용></별표단위></별표></AdmRulService>`)
+    const a = await getAdminRule(detailStub(withAnnex), { id: "2100000285140", keyword: "고시한 날" })
+    expect(a.isError).toBeFalsy()
+    expect(a.content[0].text).toContain("부칙 <제2026-103호, 2026. 9. 16.>")
+    adminRuleXmlCache.clear()
+    const b = await getAdminRule(detailStub(withAnnex), { id: "2100000285140", keyword: "외국환전문요원" })
+    expect(b.isError).toBeFalsy()
+    expect(b.content[0].text).toContain("[외국환업무등록신청서]")
+  })
+
+  it("응답 한도(MCP_MAX_TOOL_RESPONSE_CHARS)를 낮춰도 페이지가 잘리지 않고 사이에 빠지는 구간이 없다", async () => {
+    // 감사 실측: 한도 3만이면 page 1 이 29,983자에서 잘리고 page 2 는 4.5만 자부터라 약 1.5만 자를 읽을 길이 없었다
+    const big = Array.from({ length: 600 }, (_, i) => `제${i + 1}조(조문${i + 1}) ${"외국환 거래의 신고 절차는 다음과 같다.".repeat(3)}`).join("\n")
+    const xml = FX_RULE_XML.replace(HYPHEN_BLOB, big).replace(/<부칙공포일자>.*<\/부칙내용>/su, "")
+    const limit = 8000
+    const budget = new RequestExecutionBudget({ ...DEFAULT_EXECUTION_LIMITS, maxToolResponseChars: limit })
+    const read = (page: number) => requestContext.run({ budget }, () => getAdminRule(detailStub(xml), { id: "2100000285140", page }))
+    const first = (await read(1)).content[0].text
+    const total = Number(/페이지 1\/(\d+)/u.exec(first)![1])
+    const bodies: string[] = []
+    for (let p = 1; p <= total; p++) {
+      const text = (await read(p)).content[0].text
+      expect(text.length).toBeLessThanOrEqual(limit)
+      expect(text).not.toContain("잘렸습니다")
+      bodies.push(text.slice(text.indexOf(`[페이지 ${p}/${total}]\n\n`) + `[페이지 ${p}/${total}]\n\n`.length).replace(/\n\n▶ 다음: page:\d+$/u, ""))
+    }
+    expect(bodies.join("")).toBe(`${big}\n`)
+  })
+
+  it("캐시에는 파싱 결과를 두어 적중 시 XML 을 다시 파싱하지 않는다", async () => {
+    // 감사 실측: 캐시가 XML 원문이라 보험업감독업무시행세칙(XML 313만 자)은 캐시 적중이어도 jo 한 번에 1.1초
+    const spy = vi.spyOn(DOMParser.prototype, "parseFromString")
+    try {
+      await getAdminRule(detailStub(FX_RULE_XML), { id: "2100000285140", jo: "제9-5조" })
+      await getAdminRule(detailStub(FX_RULE_XML), { id: "2100000285140", keyword: "해외직접투자" })
+      await getAdminRule(detailStub(FX_RULE_XML), { id: "2100000285140", page: 1 })
+      expect(spy).toHaveBeenCalledTimes(1)
+    } finally {
+      spy.mockRestore()
+    }
+    expect(typeof adminRuleXmlCache.get(adminRuleCacheKey("2100000285140"))).toBe("object")
+  })
+
+  it("applicable_law 가 선적재한 XML 문자열도 받아 파싱 결과로 바꿔 넣는다", async () => {
+    adminRuleXmlCache.set(adminRuleCacheKey("2100000285140"), FX_RULE_WITH_REASON_XML, ADMIN_RULE_CACHE_TTL_MS)
+    const noFetch = { getAdminRule: async () => { throw new Error("재조회하면 안 된다") } } as unknown as LawApiClient
+    const r = await getAdminRule(noFetch, { id: "2100000285140", jo: "제9-5조" })
+    expect(r.content[0].text).toContain("제9-5조(해외직접투자의 신고 등)")
+    expect(typeof adminRuleXmlCache.get(adminRuleCacheKey("2100000285140"))).toBe("object")
+    // 신구대조 폴백도 같은 캐시를 쓴다
+    const stub = { fetchApi: async () => OLDNEW_EMPTY_XML, getAdminRule: noFetch.getAdminRule } as unknown as LawApiClient
+    expect((await compareAdminRuleOldNew(stub, { id: "2100000285140" })).content[0].text).toContain("원화 국제화 로드맵")
+  })
+
+  it("파라미터 없는 전문 조회는 종전 동작 그대로다 (AC#9 회귀)", async () => {
+    const r = await getAdminRule(detailStub(DETAIL_XML), { id: "2100000271110" })
+    expect(r.isError).toBeFalsy()
+    expect(r.content[0].text).toContain("제64조(급여비용 감액산정의 원칙)")
+  })
+})
+
+describe("compare_admin_rule_old_new — 제·개정이유 폴백 (T2)", () => {
+  it("신구대조 없음 + 제개정이유 있음 → 발령번호·이유 반환, NOT_FOUND 단독으로 끝나지 않는다 (AC#8)", async () => {
+    const stub = {
+      fetchApi: async () => OLDNEW_EMPTY_XML,
+      getAdminRule: async () => FX_RULE_WITH_REASON_XML,
+    } as unknown as LawApiClient
+    const r = await compareAdminRuleOldNew(stub, { id: "2100000285140" })
+    const text = r.content[0].text
+    expect(r.isError).toBeFalsy()
+    expect(text).toContain("제·개정이유로 대체")
+    expect(text).toContain("제2026-103호")
+    expect(text).toContain("개정이유")
+    expect(text).toContain("원화 국제화 로드맵")
+  })
+
+  it("신구대조도 제개정이유도 없으면 API 미제공 안내로 종료 (날조 금지)", async () => {
+    const stub = {
+      fetchApi: async () => OLDNEW_EMPTY_XML,
+      getAdminRule: async () => `<?xml version="1.0" encoding="UTF-8"?><AdmRulService><행정규칙기본정보><행정규칙명><![CDATA[이유 없는 고시]]></행정규칙명></행정규칙기본정보><조문내용><![CDATA[제1조(목적)]]></조문내용></AdmRulService>`,
+    } as unknown as LawApiClient
+    const r = await compareAdminRuleOldNew(stub, { id: "2100000000002" })
+    expect(r.isError).toBe(true)
+    expect(r.content[0].text).toContain("제·개정이유도 API 미제공")
+    expect(r.content[0].text).toContain("law.go.kr")
+  })
+
+  it("제·개정이유 조회가 일시 실패(네트워크·HTTP 500)하면 '미제공'으로 단정하지 않는다", async () => {
+    const stub = {
+      fetchApi: async () => OLDNEW_EMPTY_XML,
+      getAdminRule: async () => { throw new Error("HTTP 500: Internal Server Error") },
+    } as unknown as LawApiClient
+    const r = await compareAdminRuleOldNew(stub, { id: "2100000285140" })
+    const text = r.content[0].text
+    expect(r.isError).toBe(true)
+    expect(text).toContain("일시 조회 실패")
+    expect(text).toContain("HTTP 500")
+    expect(text).not.toContain("미제공")
+    expect(text).not.toContain("[NOT_FOUND]")
+  })
+
+  it("예산 소진은 '폴백 없음'으로 바꾸지 않고 그대로 올린다", async () => {
+    const stub = {
+      fetchApi: async () => OLDNEW_EMPTY_XML,
+      getAdminRule: async () => { throw new ExecutionLimitError("Request upstream work budget exceeded (max 48 attempts).") },
+    } as unknown as LawApiClient
+    const text = (await compareAdminRuleOldNew(stub, { id: "2100000285140" })).content[0].text
+    expect(text).toContain("budget exceeded")
+    expect(text).not.toContain("미제공")
+    expect(text).not.toContain("일시 조회 실패")
   })
 })

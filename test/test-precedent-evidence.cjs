@@ -190,11 +190,19 @@ async function testValidationAcceptsSeparatedAxisTerms() {
 }
 
 async function main() {
+  // 판례 문서는 전용 캐시에 남는다 — 같은 ID의 가짜 응답을 바꾸는 시나리오마다 비운다
+  const { precedentCache } = await import("../build/tools/precedents.js")
+  precedentCache.clear()
   await testFetchesTopTwoStructuredHits()
+  precedentCache.clear()
   await testPreservesPartialDetailFailure()
+  precedentCache.clear()
   await testCapsDetailLimit()
+  precedentCache.clear()
   await testReturnsNullForNoHits()
+  precedentCache.clear()
   await testValidationRequiresAllAxisGroups()
+  precedentCache.clear()
   await testValidationAcceptsSeparatedAxisTerms()
   console.log("precedent evidence tests passed")
 }

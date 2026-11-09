@@ -10,10 +10,12 @@ import { isDownloadNoticeOnly, parseAnnexFile } from "../lib/annex-file-parser.j
 import { truncateResponse, MAX_RESPONSE_SIZE } from "../lib/schemas.js"
 import { ErrorCodes, formatToolError, LawApiError, notFoundResponse } from "../lib/errors.js"
 import { ExecutionLimitError } from "../lib/execution-limits.js"
+import { rethrowIfFatal } from "../lib/fatal-errors.js"
 import { getRequestSignal } from "../lib/session-state.js"
 import { getLawSiteBaseUrl } from "../lib/law-url-config.js"
-import { fetchLawAnnexUnits, findMissingUnits, pickAnnexUnit } from "../lib/annex-canonical.js"
+import { fetchLawAnnexUnits, findMissingUnits, pickAnnexUnit, type LawAnnexUnit } from "../lib/annex-canonical.js"
 import { parseLawNameAndHint } from "../lib/annex-notation.js"
+import { getAnnexesAtDate } from "./annex-history.js"
 import { collectAnnexList, collectAdminAnnexList, ANNEX_PAGE_SIZE, MAX_ANNEX_PAGES, type AnnexTruncationReason } from "./annex-list.js"
 import {
   buildSelectorCandidates, extractBundledSection, extractParentLawName, extractSelectorNumbers,
@@ -31,6 +33,7 @@ export const GetAnnexesSchema = z.object({
   annexNo: z.string().optional().describe("별표 번호 (예: '4', '별표4', '제4호'). bylSeq 대체 입력"),
   query: z.string().optional().describe("별표명으로 좁히기 (예: '운전면허 취소·정지', '과태료'). 번호를 모를 때 사용. 1건으로 좁혀지면 그 별표 본문을 바로 추출"),
   jo: z.string().optional().describe("위임 조문 (예: '제38조', '38'). 조문 동반 질의('관세법 제38조 별표2')의 조문 맥락 — 별표명의 '(제38조 관련)' 표기와 대조해 좁히고, 응답에 위임 관계를 표기"),
+  date: z.string().optional().describe("기준일 (예: '2015-06-01'). 지정 시 그날 시행 중이던 법령 버전의 별표를 조회 — 건축허가·착공·처분·위반 시점 기준이 필요할 때. 제명이 바뀐 법령도 옛 버전까지 찾는다. 별표 번호는 시점마다 다를 수 있으니 query(별표명)로 좁히는 것이 안전. 미지정 시 현행"),
   apiKey: z.string().optional().describe("법제처 Open API 인증키(OC). 사용자가 제공한 경우 전달")
 })
 
@@ -47,6 +50,9 @@ export async function getAnnexes(
     const queryHint = input.query ? parseLawNameAndHint(input.query).annexNo : undefined
     const annexSelector = (input.bylSeq || input.annexNo || parsedLawInput.annexNo || queryHint || "").trim()
 
+    // 기준일 지정 → 그날 시행 버전의 별표 (법령ID 계보로 버전 특정)
+    if (input.date) return await getAnnexesAtDate(apiClient, input, normalizedLawName, annexSelector, extractAnnexContent)
+
     let annexList: AnnexItem[] = []
     let lawType: string = "law"
     // 100건 창에 갇힌 목록을 완전한 목록으로 보여주면 "그 별표는 없다"는 오답이 된다 (#148).
@@ -60,6 +66,17 @@ export async function getAnnexes(
       lawType = r.type
       listTruncated = r.truncated
       listReason = r.reason
+    }
+
+    // 2026-09-23 리뷰 C9: 현행 본문(target=law, 실측 3.8MB)을 목록 병합과 본문 추출이 각각 받았다(fetchApi 캐시 없음).
+    // 한 요청 안에서 MST 별로 기억한다. 실패는 기억하지 않아 종전처럼 추출 단계가 다시 시도한다.
+    const unitsByMst = new Map<string, LawAnnexUnit[]>()
+    const loadUnits = async (mst: string): Promise<LawAnnexUnit[]> => {
+      const hit = unitsByMst.get(mst)
+      if (hit) return hit
+      const units = await fetchLawAnnexUnits(apiClient, mst, input.apiKey)
+      unitsByMst.set(mst, units)
+      return units
     }
 
     // "rung이 던졌다(장애)"와 "정상 응답인데 0건(부존재)"은 다른 사실이다 (#150).
@@ -165,7 +182,7 @@ export async function getAnnexes(
 
     // 별표 선택값 지정 시 → 해당 별표 파일 다운로드 + 텍스트 추출
     if (annexSelector) {
-      return await extractAnnexContent(apiClient, filtered, annexSelector, normalizedLawName, lawType, input)
+      return await extractAnnexContent(apiClient, filtered, annexSelector, normalizedLawName, lawType, input, loadUnits)
     }
 
     // 별표 선택값 미지정 → 목록 반환. 법령은 현행 본문 별표단위와 대조해
@@ -177,7 +194,7 @@ export async function getAnnexes(
       const mst = msts.size === 1 ? [...msts][0] : ""
       if (mst) {
         try {
-          const units = await fetchLawAnnexUnits(apiClient, mst, input.apiKey)
+          const units = await loadUnits(mst)
           const missing = findMissingUnits(filtered, units)
           listForDisplay = [
             ...filtered,
@@ -190,7 +207,8 @@ export async function getAnnexes(
               관련법령명: normalizedLawName,
             })),
           ]
-        } catch {
+        } catch (error) {
+          rethrowIfFatal(error)
           // 병합 실패를 삼키면 신설 별표가 빠진 목록이 완전한 목록으로 보인다 (#127).
           // 목록 자체는 유효하므로 isError가 아니라 마커로 알린다.
           mergeIssue = "현행 본문 조회 실패"
@@ -208,7 +226,7 @@ export async function getAnnexes(
     const scoped = filterByAnnexQuery(byArticle.list, input.query)
     const onlySeq = scoped.list.length === 1 ? String(scoped.list[0].별표번호 || "").trim() : ""
     if (scoped.matched && scoped.keywords.length > 0 && onlySeq) {
-      return await extractAnnexContent(apiClient, scoped.list, onlySeq, normalizedLawName, lawType, input)
+      return await extractAnnexContent(apiClient, scoped.list, onlySeq, normalizedLawName, lawType, input, loadUnits)
     }
     return formatAnnexList(scoped.list, lawType, input, normalizedLawName, scoped, mergeIssue, listTruncated, listReason, byArticle)
   } catch (error) {
@@ -224,7 +242,8 @@ async function extractAnnexContent(
   annexSelector: string,
   normalizedLawName: string,
   lawType: string,
-  input: GetAnnexesInput
+  input: GetAnnexesInput,
+  loadUnits: (mst: string) => Promise<LawAnnexUnit[]> = (mst) => fetchLawAnnexUnits(apiClient, mst, input.apiKey)
 ): Promise<{ content: Array<{ type: string, text: string }>, isError?: boolean }> {
   const knd = input.knd
   // bylSeq / annexNo / lawName 내 힌트로 유연 매칭 (별표/서식 구분 위해 knd 전달)
@@ -237,7 +256,7 @@ async function extractAnnexContent(
     const mst = matched?.관련법령일련번호 || annexList[0]?.관련법령일련번호
     if (mst) {
       try {
-        const units = await fetchLawAnnexUnits(apiClient, String(mst), input.apiKey)
+        const units = await loadUnits(String(mst))
         const unit = pickAnnexUnit(units, {
           code6: matched?.별표번호 ? String(matched.별표번호).trim() : undefined,
           kind: matched?.별표종류 ? String(matched.별표종류) : undefined,
@@ -254,7 +273,8 @@ async function extractAnnexContent(
             별표서식PDF파일링크: unit.pdfLink || matched?.별표서식PDF파일링크,
           }
         }
-      } catch {
+      } catch (error) {
+        rethrowIfFatal(error)
         // 정본 조회 실패 → licbyl 링크로 진행. 그 링크가 구본을 가리킬 수 있다는
         // 사실을 삼키면 구본 내용이 현행으로 읽힌다 (#127, #77과 같은 손실).
         canonicalIssue = true

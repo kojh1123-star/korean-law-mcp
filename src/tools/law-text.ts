@@ -4,19 +4,25 @@
 
 import { z } from "zod"
 import type { LawApiClient } from "../lib/api-client.js"
-import { buildJO } from "../lib/law-parser.js"
+import { lawJoCode } from "../lib/law-jo.js"
 import { lawCache } from "../lib/cache.js"
 import { formatArticleUnit } from "../lib/article-parser.js"
 import { getStrategyWarning } from "../lib/article-warnings.js"
 import { formatToolError } from "../lib/errors.js"
+import { rethrowIfFatal } from "../lib/fatal-errors.js"
+import { fetchLineageVersions, isRepealRow, lawStateAt, todayKst, versionInForce, withPriorSameNameLaw } from "../lib/law-lineage.js"
+import type { HistoricalVersion } from "../lib/historical-utils.js"
+import { UpstreamRecordMissingError } from "../lib/upstream-miss.js"
+import { formatDateDot } from "../lib/schemas.js"
+import { flattenAddendum, normalizeDate } from "./applicable-law.js"
 
 import { MAX_RESPONSE_SIZE, truncateResponse } from "../lib/schemas.js"
 
 export const GetLawTextSchema = z.object({
   mst: z.string().optional().describe("법령일련번호 (search_law에서 획득)"),
   lawId: z.string().optional().describe("법령ID (search_law에서 획득)"),
-  jo: z.string().optional().describe("조문 번호. 자연어 표기 권장 — '제38조'·'제148조의2'를 그대로 넣으면 서버가 변환한다. 6자리 JO 코드 직접 지정 시 조번호 4자리 zero-pad + 의X 2자리: 제38조→003800, 제10조의2→001002, 제234조의2→023402(234002 아님)"),
-  efYd: z.string().optional().describe("시행일자 (YYYYMMDD 형식)"),
+  jo: z.string().optional().describe("조문 번호. 자연어 표기 권장 — '제38조'·'제148조의2'를 그대로 넣으면 서버가 변환한다. 6자리 JO 코드 직접 지정 시 조번호 4자리 zero-pad + 의X 2자리: 제38조→003800, 제10조의2→001002, 제234조의2→023402(234002 아님). '부칙' 이면 부칙 원문(최근 공포부터)"),
+  efYd: z.string().optional().describe("기준일 또는 시행일자 (YYYYMMDD). 시행일이면 그 버전, 시행일이 아닌 날짜(건축허가일·사건일 같은 조회 기준일)면 그날 시행 중이던 버전으로 자동 보정한다(제명이 바뀌기 전 버전 포함). 현행 본문은 efYd 없이 조회할 것. 시행예정본은 search_law 가 안내한 efYd 를 그대로 쓴다."),
   apiKey: z.string().optional().describe("법제처 Open API 인증키(OC). 사용자가 제공한 경우 전달")
 }).refine(data => data.mst || data.lawId, {
   message: "mst 또는 lawId 중 하나는 필수입니다"
@@ -24,16 +30,32 @@ export const GetLawTextSchema = z.object({
 
 export type GetLawTextInput = z.infer<typeof GetLawTextSchema>
 
+type LawTextResponse = { content: Array<{ type: string, text: string }>, isError?: boolean }
+
+/** 계보로 고른 버전의 오늘 기준 상태. 이게 있으면 efYd 는 실재 시행일이다 — 미스 확인 1회로 줄이지 않고 다시 보정하지 않는다 */
+type ResolvedStatus = "current" | "past" | "scheduled"
+
 export async function getLawText(
   apiClient: LawApiClient,
   input: GetLawTextInput
-): Promise<{ content: Array<{ type: string, text: string }>, isError?: boolean }> {
+): Promise<LawTextResponse> {
   try {
+    return await renderLawText(apiClient, input)
+  } catch (error) {
+    return formatToolError(error, "get_law_text")
+  }
+}
+
+/** 본문 조회·렌더. 오류를 던진다 — 기준일 보정의 재귀 호출이 예산 소진·취소를 "시행일 없음"으로 삼키지 않게 */
+async function renderLawText(apiClient: LawApiClient, input: GetLawTextInput, resolved?: ResolvedStatus): Promise<LawTextResponse> {
+  {
+    // jo="부칙" 은 조문이 아니라 부칙 원문 — 전문을 받아 부칙만 낸다
+    const wantAddenda = input.jo?.trim() === "부칙"
     // 조문 번호가 한글이면 JO 코드로 변환
-    let joCode = input.jo
-    if (joCode && /제\d+조/.test(joCode)) {
+    let joCode = wantAddenda ? undefined : input.jo
+    if (joCode && !/^\d{6}$/.test(joCode)) {
       try {
-        joCode = buildJO(joCode)
+        joCode = lawJoCode(joCode)
       } catch (e) {
         return {
           content: [{
@@ -46,7 +68,12 @@ export async function getLawText(
     }
 
     // Check cache first (efYd 정규화: 미지정 → 'current'로 통일)
-    const cacheKey = `lawtext:${input.mst || input.lawId}:${joCode || 'full'}:${input.efYd || 'current'}`
+    // mst·lawId 는 번호 체계가 달라 같은 값이 다른 법령이다(001706: mst=사방사업법, lawId=민법) — 접두로 가른다
+    // 보정 재조회(resolved)는 현행성 표기가 달라 직접 조회와 캐시를 나눈다
+    const cacheKey = `lawtext:${input.mst ? `m${input.mst}` : `i${input.lawId}`}:${wantAddenda ? "addenda" : joCode || 'full'}:${input.efYd || 'current'}${resolved ? `:${resolved}` : ""}`
+    // MST·efYd 는 버전을 못박으므로 하루를 둔다. lawId 만 준 "현행" 조회는 개정 시행일을 넘기면
+    // 다른 본문이 현행이 되므로 1시간만 둔다(24시간이면 시행일 당일 옛 본문이 나갔다, 리뷰 A8).
+    const cacheTtl = input.mst || input.efYd ? 24 * 60 * 60 * 1000 : 60 * 60 * 1000
     const cached = lawCache.get<string>(cacheKey)
     if (cached) {
       return {
@@ -57,23 +84,54 @@ export async function getLawText(
       }
     }
 
-    const jsonText = await apiClient.getLawText({
-      mst: input.mst,
-      lawId: input.lawId,
-      jo: joCode,
-      efYd: input.efYd,
-      apiKey: input.apiKey
-    })
+    let jsonText: string
+    try {
+      jsonText = await apiClient.getLawText({
+        mst: input.mst,
+        lawId: input.lawId,
+        jo: joCode,
+        efYd: input.efYd,
+        // 사용자가 준 efYd 는 시행일이 아닐 수 있다 — 미스면 사다리 대신 확인 1회 뒤 아래 보정으로.
+        // lawId 현행 조회와 계보로 고른 실재 시행일 재조회는 종전 사다리로 일시 장애를 버틴다
+        efYdMayMiss: Boolean(input.efYd) && !resolved,
+        apiKey: input.apiKey
+      })
+    } catch (error) {
+      // 없는 시행일에 조문(JO)까지 붙으면 빈 봉투가 아니라 HTML 미스로 온다 — 아래 빈 봉투와 같이 기준일 보정을 시도한다.
+      // 미스만이다: 503·타임아웃까지 보정하면 같은 장애를 한 번 더 겪어 시도·시간이 두 배가 됐다(무응답 90초, 2026-10-01 감사)
+      if (!input.efYd || resolved) throw error
+      rethrowIfFatal(error)
+      if (!(error instanceof UpstreamRecordMissingError)) throw error
+      const redirected = await retryAtVersionInForce(apiClient, input, wantAddenda ? "부칙" : joCode)
+      if (!redirected) throw error
+      if (!redirected.isError) lawCache.set(cacheKey, redirected.content[0].text, cacheTtl)
+      return redirected
+    }
 
     const json = JSON.parse(jsonText)
 
     // JSON 구조 파싱 (LexDiff 방식 적용)
     const lawData = json?.법령
     if (!lawData) {
+      // efYd 가 시행일이 아니면(흔히 "조회 기준일"로 오늘·사건일을 넣는다, #160) 그날 시행 중이던 버전으로 다시 조회한다
+      if (input.efYd && !resolved) {
+        const redirected = await retryAtVersionInForce(apiClient, input, wantAddenda ? "부칙" : joCode)
+        if (redirected) {
+          if (!redirected.isError) lawCache.set(cacheKey, redirected.content[0].text, cacheTtl)
+          return redirected
+        }
+      }
+      // efYd 가 붙어 있으면 그게 1순위 용의자다. 종전 메시지는 무조건 mst/lawId 를 탓해,
+      // 식별자가 멀쩡한데도 "search_law 로 유효한 mst 를 확인하라"고 엉뚱한 곳을 가리켰다
+      // (#160: search_law 가 준 mst/lawId 그대로인데 efYd 에 오늘 날짜를 넣어 NOT_FOUND).
+      const retryArg = input.mst ? `mst="${input.mst}"` : `lawId="${input.lawId || ""}"`
+      const hint = input.efYd
+        ? `⚠️ efYd=${input.efYd} 에 시행 중이던 버전을 찾지 못했습니다 (그 법령의 최초 시행일보다 앞선 날짜이거나 연혁 조회가 실패했을 수 있습니다).\n→ 현행 본문: get_law_text(${retryArg}) 로 efYd 없이 재조회\n→ 시행예정본: search_law 가 안내한 efYd 를 그대로 사용\n→ 그 시점 적용 법령 판단: legal_analysis(mode="applicable_law")\nmst/lawId 자체는 유효할 수 있습니다.`
+        : `⚠️ 법제처 API가 해당 mst/lawId에 대해 데이터를 반환하지 않았습니다. search_law로 유효한 mst를 먼저 확인하세요.`
       return {
         content: [{
           type: "text",
-          text: "[NOT_FOUND] 법령 데이터를 찾을 수 없습니다.\n\n⚠️ 법제처 API가 해당 mst/lawId에 대해 데이터를 반환하지 않았습니다. LLM이 조문을 추측/생성하지 마세요. search_law로 유효한 mst를 먼저 확인하세요."
+          text: `[NOT_FOUND] 법령 데이터를 찾을 수 없습니다.\n\n${hint}\n\nLLM이 조문을 추측/생성하지 마세요.`
         }],
         isError: true
       }
@@ -116,8 +174,12 @@ export async function getLawText(
 
     // 현행성 라벨: LLM이 옛 버전 조문을 현행으로 오인하지 않도록
     // 조회 시점 날짜와 시행일자를 비교해 명시
-    const today = new Date().toISOString().slice(0, 10).replace(/-/g, "")
-    if (input.efYd) {
+    const today = todayKst()
+    if (resolved === "current") {
+      resultText += `ℹ️ 조회기준일 ${today} 현재 현행 버전 (시행 ${input.efYd}).\n`
+    } else if (resolved === "scheduled") {
+      resultText += `⚠️ 시행예정 버전 (시행 ${input.efYd}, 조회기준일 ${today} 현재 미시행). 그 사이 다른 개정이 더 공포될 수 있음.\n`
+    } else if (input.efYd) {
       resultText += `⚠️ 특정 시행일자(efYd=${input.efYd}) 버전 조회 — 현행 법령이 아닐 수 있음. 현행 기준 답변에는 efYd 없이 재조회할 것.\n`
     } else if (effDate && String(effDate) > today) {
       resultText += `⚠️ 시행 예정 버전 (조회기준일 ${today} 현재 미시행). 현재 효력 있는 조문과 다를 수 있음.\n`
@@ -125,6 +187,33 @@ export async function getLawText(
       resultText += `ℹ️ 조회기준일 ${today} — 위 시행일 버전 본문. 연혁 MST로 조회한 경우 과거 버전일 수 있으니, 개정 여부가 의심되면 search_law로 [현행] MST를 재확인할 것.\n`
     }
     resultText += `\n`
+
+    // 부칙(법령.부칙.부칙단위 — 배열 또는 단일 객체). 최근 공포부터
+    const rawAddenda = lawData.부칙?.부칙단위
+    const addenda = (Array.isArray(rawAddenda) ? rawAddenda : rawAddenda ? [rawAddenda] : [])
+      .map((unit: any) => ({ unit, lines: flattenAddendum(unit?.부칙내용) }))
+      .filter(a => a.lines.length > 0)
+      .sort((a, b) => String(b.unit?.부칙공포일자 || "").localeCompare(String(a.unit?.부칙공포일자 || "")))
+    const idArg = input.mst ? `mst="${input.mst}"` : `lawId="${input.lawId}"`
+    const addendaHint = addenda.length ? `\n부칙 ${addenda.length}건: get_law_text(${idArg}, jo="부칙")` : ""
+
+    if (wantAddenda) {
+      if (addenda.length === 0) {
+        return { content: [{ type: "text", text: resultText + `[NOT_FOUND] 이 법령 버전에서 부칙을 받지 못했습니다.\n→ 목차: get_law_text(${idArg})\n\nLLM이 부칙을 추측/생성하지 마세요.` }], isError: true }
+      }
+      let text = resultText + `부칙 ${addenda.length}건 (최근 공포부터)\n\n`
+      for (const { unit, lines } of addenda) {
+        // 원문 머리 줄("부칙 <제10호,1987.10.29>")은 공포번호·일자가 있으면 표준 표기로 바꾼다
+        const header = unit?.부칙공포번호
+          ? `부칙 <제${parseInt(String(unit.부칙공포번호), 10)}호, ${formatDateDot(String(unit?.부칙공포일자 || ""))}>`
+          : lines[0].startsWith("부칙") ? lines[0] : "부칙"
+        const bodyLines = lines[0].startsWith("부칙") ? lines.slice(1) : lines
+        text += `${header}\n${bodyLines.join("\n")}\n\n`
+      }
+      const truncated = truncateResponse(text.trimEnd())
+      lawCache.set(cacheKey, truncated, cacheTtl)
+      return { content: [{ type: "text", text: truncated }] }
+    }
 
     // 조문 내용 추출 (정확한 경로: 법령.조문.조문단위)
     // 주의: 조문단위는 배열 또는 객체일 수 있음
@@ -135,6 +224,15 @@ export async function getLawText(
       articleUnits = rawUnits
     } else if (rawUnits && typeof rawUnits === 'object') {
       articleUnits = [rawUnits]  // 단일 객체를 배열로 변환
+    }
+
+    // JO may be ignored upstream. Never render an unrelated article as the requested one.
+    if (joCode) {
+      const number = parseInt(joCode.slice(0, 4), 10)
+      const branch = parseInt(joCode.slice(4, 6), 10)
+      articleUnits = articleUnits.filter(unit => unit?.조문여부 === "조문"
+        && parseInt(String(unit.조문번호 ?? ""), 10) === number
+        && (parseInt(String(unit.조문가지번호 ?? "0"), 10) || 0) === branch)
     }
 
     if (articleUnits.length === 0) {
@@ -163,7 +261,7 @@ export async function getLawText(
             errorMsg += `\n      get_law_text(lawId="${input.lawId}", jo="제${suggestJo}조")`
           }
           errorMsg += `\n\n   3. 키워드 검색:`
-          errorMsg += `\n      search_all(query="${lawName.replace(/\s+(시행령|시행규칙)/, '')}")`
+          errorMsg += `\n      execute_tool(tool_name="search_all", params={query:"${lawName.replace(/\s+(시행령|시행규칙)/, '')}"})`
         } else {
           errorMsg += `\n\n[NOT_FOUND] 조문을 찾을 수 없습니다. 다음을 시도해보세요:`
           errorMsg += `\n   - 전체 법령 조회 (jo 파라미터 생략)`
@@ -205,10 +303,11 @@ export async function getLawText(
         tocText += `lawId="${input.lawId}", jo="제XX조")`
       }
       tocText += `\n여러 조문 일괄 조회: get_batch_articles 도구 사용`
+      tocText += addendaHint
 
       // 절단본을 캐시 — 캐시 히트 경로는 절단 없이 반환하므로 미절단 캐시 시 5만 자 제한 우회됨
       const truncatedToc = truncateResponse(tocText)
-      lawCache.set(cacheKey, truncatedToc)
+      lawCache.set(cacheKey, truncatedToc, cacheTtl)
       return {
         content: [{
           type: "text",
@@ -279,8 +378,10 @@ export async function getLawText(
       resultText += `\n여러 조문 일괄 조회: get_batch_articles 도구 사용`
     }
 
+    resultText += addendaHint
+
     // Cache the result
-    lawCache.set(cacheKey, resultText)
+    lawCache.set(cacheKey, resultText, cacheTtl)
 
     return {
       content: [{
@@ -288,7 +389,86 @@ export async function getLawText(
         text: resultText
       }]
     }
+  }
+}
+
+/** mst → 법령ID. 공포본 번호라 바뀌지 않는다 — 같은 기준일로 조문 여러 개를 볼 때 매번 받던 것을 하루 둔다 */
+async function lawIdOfMst(apiClient: LawApiClient, mst: string, apiKey?: string): Promise<string | undefined> {
+  const key = `mstlawid:${mst}`
+  const hit = lawCache.get<string>(key)
+  if (hit) return hit
+  const head = JSON.parse(await apiClient.getLawText({ mst, jo: "000100", apiKey }))
+  const id = head?.법령?.기본정보?.법령ID
+  if (id) lawCache.set(key, String(id), 24 * 60 * 60 * 1000)
+  return id ? String(id) : undefined
+}
+
+/** 법령ID 계보. 새 공포본이 붙으므로 1시간 (큰 법령은 4쪽이라 조문마다 받으면 HTTP 배치 예산이 바닥났다) */
+async function lineageOf(apiClient: LawApiClient, lawId: string, apiKey?: string): Promise<HistoricalVersion[]> {
+  const key = `lineage:${lawId}`
+  const hit = lawCache.get<HistoricalVersion[]>(key)
+  if (hit) return hit
+  const { versions } = await fetchLineageVersions(apiClient, lawId, apiKey)
+  if (versions.length > 0) lawCache.set(key, versions, 60 * 60 * 1000)
+  return versions
+}
+
+/**
+ * efYd 를 기준일로 보고 그날 시행 중이던 버전(MST+시행일)으로 다시 조회한다. 못 풀면 undefined(호출부가 원래 오류·NOT_FOUND).
+ * 과거본은 eflaw 에 MST+시행일로만 닿는다(lawId+efYd 는 빈 봉투, 2026-09-28 실측). 법령ID는 lawId 가 오면 그대로,
+ * mst 만 오면 target=law&MST&JO=000100(약 2KB)으로 얻어 계보를 받는다. 재조회는 resolved 로 불러 다시 보정하지 않는다.
+ * 그 버전에서 받은 오류(그때 없던 조문 등)는 보정 사실과 함께 그대로 돌려준다 — "그날 버전을 못 찾았다"로 바꾸면 원인을 지운다.
+ * 예산 소진·취소는 올린다(rethrowIfFatal) — 공개 도구(getLawText)를 거치면 그게 "시행일 없음"으로 바뀌었다.
+ */
+async function retryAtVersionInForce(apiClient: LawApiClient, input: GetLawTextInput, joCode?: string): Promise<LawTextResponse | undefined> {
+  const ymd = normalizeDate(input.efYd || "")
+  if (!ymd) return undefined
+  try {
+    const lawId = input.lawId || (input.mst ? await lawIdOfMst(apiClient, input.mst, input.apiKey) : undefined)
+    if (!lawId) return undefined
+    let versions = await lineageOf(apiClient, String(lawId), input.apiKey)
+    let state = lawStateAt(versions, ymd)
+    // 폐지 후 같은 이름으로 재제정된 법령(근로기준법 1997.3.13.)은 계보가 신법만이라 그 전 기준일이 비었다 — 동명 구법 연혁을 붙인다.
+    // 계보 시작보다 앞선 기준일에서만 드는 비용이다
+    const first = versions[versions.length - 1]
+    if (!state.version && !state.repeal && first && ymd < first.efYd) {
+      versions = await withPriorSameNameLaw(apiClient, versions, ymd, input.apiKey)
+      state = lawStateAt(versions, ymd)
+    }
+    const { version: v, repeal } = state
+    if (repeal) {
+      const last = versions.find(x => x.efYd < repeal.efYd && !isRepealRow(x))
+      const lastLine = last ? `\n→ 폐지 직전 버전: 시행 ${formatDateDot(last.efYd)}, MST ${last.mst} — get_law_text(mst="${last.mst}", efYd="${last.efYd}")` : ""
+      return {
+        content: [{ type: "text", text: `[NOT_FOUND] efYd=${input.efYd} 당시 이 법령은 이미 폐지됐습니다: ${formatDateDot(repeal.efYd)} ${repeal.rrCls} (공포 제${repeal.ancNo}호).${lastLine}\n\nLLM이 조문을 추측/생성하지 마세요.` }],
+        isError: true,
+      }
+    }
+    if (!v) return undefined
+    const today = todayKst()
+    const status: ResolvedStatus = v.efYd > today ? "scheduled" : versionInForce(versions, today) === v ? "current" : "past"
+    const where = `시행 ${formatDateDot(v.efYd)}, 공포 제${v.ancNo}호${v.rrCls ? ` ${v.rrCls}` : ""}, MST ${v.mst}${v.lawNm ? `, 당시 법령명 「${v.lawNm}」` : ""}` +
+      (v.priorLaw ? ", 법령ID가 다른 동명 구법(폐지 후 같은 이름으로 재제정되기 전)" : "")
+    // 입력이 이미 그 버전이면(확인 1회 미스는 순간 장애일 수 있다) 사다리로 한 번 더 받을 뿐 보정 안내는 없다.
+    // 시행일은 맞는데 lawId 라서 안 나온 경우(과거본은 MST+시행일로만 닿는다), 다른 공포본의 시행일인 경우, 시행일이 아닌 경우를 가른다
+    const note = v.efYd === input.efYd && v.mst === input.mst ? ""
+      : v.efYd !== ymd ? `ℹ️ efYd=${input.efYd}는 이 법령의 시행일이 아니어서, 그날(${formatDateDot(ymd)}) 시행 중이던 버전으로 조회했습니다: ${where}\n`
+      : input.mst ? `ℹ️ efYd=${input.efYd}는 MST ${input.mst}의 시행일이 아니라 다른 공포본의 시행일이어서 그 버전으로 조회했습니다: ${where}\n`
+      : `ℹ️ efYd=${input.efYd} 버전은 lawId 로는 조회되지 않아 MST 로 조회했습니다: ${where}\n`
+    let r: LawTextResponse
+    try {
+      r = await renderLawText(apiClient, { mst: v.mst, jo: joCode, efYd: v.efYd, apiKey: input.apiKey }, status)
+    } catch (error) {
+      if (!(error instanceof UpstreamRecordMissingError) || !input.jo) throw error
+      // 그 버전은 계보상 실재한다 — 남는 원인은 그때 없던 조문이거나 법제처 일시 장애다
+      r = {
+        content: [{ type: "text", text: `[NOT_FOUND] 그 버전(${where})에서 ${input.jo}를 받지 못했습니다 — 당시 없던 조문이거나 법제처 일시 장애일 수 있습니다.\n→ 그 버전 목차: get_law_text(mst="${v.mst}", efYd="${v.efYd}")\n\nLLM이 조문을 추측/생성하지 마세요.` }],
+        isError: true,
+      }
+    }
+    return { content: [{ type: "text", text: note + r.content.map(c => c.text).join("\n") }], isError: r.isError }
   } catch (error) {
-    return formatToolError(error, "get_law_text")
+    rethrowIfFatal(error)
+    return undefined
   }
 }

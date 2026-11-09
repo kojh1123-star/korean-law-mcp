@@ -19,6 +19,10 @@
 
 [한국어](./README.md)
 
+**Start in one line:** add `https://mcp.gomdori.app/law?oc=YOUR_KEY` as a custom connector in Claude.ai, or run `npx --ignore-scripts --omit=optional korean-law-mcp setup` → [Quick Start](#quick-start)
+
+If this saves you time, a GitHub ⭐ helps others find it.
+
 [![Korean Law MCP — watch the demo](./docs/video-intro.jpg)](https://youtu.be/gmkuOqIV3dc)
 
 <sub>▶ Click to play on YouTube. Narration is in Korean.</sub>
@@ -28,6 +32,116 @@
 | Connect to Claude | Connect to ChatGPT |
 |:---:|:---:|
 | [![Connect to Claude](./docs/video-claude.jpg)](https://youtu.be/KaUKLOH7290) | [![Connect to ChatGPT](./docs/video-gpt.jpg)](https://youtu.be/KCFIzervxtE) |
+
+---
+
+## v4.15.9: Labor administration decisions
+
+- `search_decisions` and `get_decision_text` add Ministry of Employment and Labor interpretations (`moel`), Industrial Accident Compensation Insurance review decisions (`iaciac`) and Employment Insurance review decisions (`eiac`). Contributed by @adfakdjk332 (#175). [Changelog](CHANGELOG.md)
+
+---
+
+## v4.15.8: Addenda lookup
+
+- `get_law_text(mst, jo="부칙")` returns the addenda (effective dates, transitional provisions), newest first — e.g. the Constitution's addendum Articles 1–6. The table of contents and full text now end with the addenda count. [Changelog](CHANGELOG.md)
+
+---
+
+## v4.15.7: Month-end dates and eight-digit case numbers
+
+- Fixed `지난달`, `N개월 전`, and `최근 N개월` selecting the wrong month at month end (on March 30, "지난달" now means February)
+- Fixed eight-digit case serials being dropped from citation verification and nine-digit serials being truncated into a different case. [Changelog](CHANGELOG.md), issues #169 and #170
+
+---
+
+## v4.15.6: Precedent body-search option
+
+- Added `search="both"` for precedent search: runs title and full-text search together, dedupes by precedent ID, and labels which search matched each hit. `search_decisions(domain="precedent", options={search:"both"})`
+- When a title search ends with 3 or fewer hits, the output suggests a full-text re-search (measured: "학원강사 근로자" 1 title hit vs 70 full-text hits)
+- Fixed string `search:"2"` passed via options being treated as a title search. Default behavior unchanged. [Changelog](CHANGELOG.md), issue #167
+
+---
+
+## v4.15.5: Retrieval and verification boundaries
+
+- Fixed missing precedent bodies, cancelled cache reads, and statute/branch boundaries in article ranges
+- Included spaced case numbers in citation verification and corrected article-code handoffs and keyword extraction
+- Fixed decision compaction/legal grounds, law hierarchy/sample labels, and daily-law/term rendering
+- Prevented historical-slice substitution and strengthened MCP/CLI key masking and CLI argument limits
+- Reviewed all features again. No new features or dependency changes. [Changelog](CHANGELOG.md), [review evidence](docs/PRODUCTION-REVIEW-3-2026-10-02.md)
+
+---
+
+## v4.15.4: Full feature review and fixes
+
+- Corrected case-number matching, summary boundaries, article/annex selection, and citation-mode three-tier responses
+- Preserved decision, treaty and English-law fields; marked skipped citations and failed scenario lookups
+- Corrected ordinance dates and parent-law references, and restored risk detection beyond truncated article excerpts
+- Fixed HTTP cancellation/key forwarding, competition research routing, official links and CLI inputs
+- Reviewed all 99 internal tools and 10 exposed tools. No new features or dependency changes. [Changelog](CHANGELOG.md), [review evidence](docs/PRODUCTION-REVIEW-2-2026-10-02.md)
+
+---
+
+## v4.15.3: Retrieval correctness and performance
+
+- Exact case-number searches, per-case fallback validation, and explicit unconfirmed status when treatment scanning is disabled
+- A bounded cache of 20 parsed precedent records shared by text retrieval and citation tracking
+- Shared in-progress statute reads within a batch of article requests
+- Total deadlines and cancellation through body reads; corrected annex/article selection and effective-date slice comparisons
+- Patch release with no added features. [Changelog](CHANGELOG.md), [review evidence](docs/PRODUCTION-REVIEW-2026-10-02.md)
+
+---
+
+## v4.15.2: Audit fixes for recent releases
+
+An audit of 4.14.0 to 4.15.1 turned up places that gave silently wrong answers or ran slow. Exposed tools and arguments are unchanged.
+
+- Next-step hints in tool output now point only at exposed tools (22 hints named tools that are not in the tool list)
+- Precedent text no longer carries raw `<br/>` tags, and the condensed body no longer cuts in the middle of a date
+- History lookups: admin-rule version on a reference date, the pre-1997 history of laws re-enacted under the same name, and repeal/current labels when a reference date is resolved
+- Chains keep what they received when they hit the time limit; document_review and law statistics now have a time limit too
+- kordoc pinned to 4.18.2, automatic PDF OCR turned off
+
+---
+
+## v4.15.1: Annexes as they look in the original
+
+The annex parser (kordoc 4.17.0) now reads annexes the way they look in the original HWP. 103 of 272 annexes lay out the whole page with
+invisible-border frame tables, which used to come out as one giant table. Borderless frames are now plain text, only ruled parts stay tables,
+and fractions built from two cells and a rule become `$\frac{…}{…}$`.
+
+- Exact-match tables against what the original shows (346 tables): HWP 66 → **346**, law.go.kr PDF 56 → **335**
+- The `get_law_text` `efYd` description now says a reference date (building permit, incident date) resolves to the version in force that day
+
+---
+
+## v4.15.0: Point-in-time lookups that survive law renames
+
+Korean statutes are often renamed (the fire-safety act changed its title three times since 2004). History used to be matched by title, so every version before a rename vanished and `applicable_law` answered "not yet in force" for a 2015 date. Versions are now chained by the statute ID (`eflaw` search with `LID`), in effective-date slices. Still 10 tools; only optional parameters were added.
+
+- `applicable_law` resolves former titles (e.g. the 2015 fire-safety decree, 9 → **79** versions in the history list) and warns when a full revision renumbered the articles in between
+- `get_annexes` takes `date` and returns the annex of the version in force that day (e.g. installation criteria at building-permit time)
+- `applicable_law` also handles administrative rules (notices) such as the sprinkler fire-safety standard (NFSC 103 → NFPC 103, one lineage since 2004); NFTC-style section numbers (`jo: "2.7.3"`) work in `get_admin_rule`
+- `get_law_text` treats a non-effective `efYd` (today, an incident date) as a reference date instead of failing
+- `verify_citations` reports a renamed statute as renamed, not repealed; `get_article_history` no longer drops changes beyond the first page
+- Default upstream body limits raised to 8/24 MiB (matching the hosted server); repeat annex lookups 2.4s → 0.8s. See [CHANGELOG](CHANGELOG.md)
+
+## v4.13.0 — Compliance-register monitoring: 98 calls down to 1-2
+
+Three field reports from running an ISO compliance register (108 laws across 8 domains) against this server:
+[#157](https://github.com/chrisryugj/korean-law-mcp/issues/157) · [#158](https://github.com/chrisryugj/korean-law-mcp/issues/158) · [#159](https://github.com/chrisryugj/korean-law-mcp/issues/159) (@thkim660207-cmd). Tests 738 → **758**.
+
+- **`search_law_bulk`**: takes an array of law names and returns one compact line each — `law_id · MST · effective_date · upcoming`.
+  Pass `previous={law_id: previous_MST}` for diff mode: only laws whose MST changed come back, so a full register sweep
+  costs one or two calls. The response ends with a snapshot JSON you feed straight into the next run. Amendments that are
+  promulgated but not yet in force do not change the current MST, so they are reported separately instead of silently
+  reading as "unchanged"
+- **Per-article amendment history is now opt-in** (`includeHistory=true` to restore): it used to be dumped from original
+  enactment every time, and on the Occupational Safety and Health Act (enacted 1981) that section alone exhausted the
+  50k-char response budget — truncating the old-vs-new comparison table people actually needed
+- **Image-only annexes now say so**: some notices return discharge-limit tables as `<img>` tags with no text. That used to
+  pass through as "has content", which is exactly where a model starts guessing numbers. Now it carries a warning plus the
+  source URL and the **original attachment (hwpx/pdf) links** — which the API was already returning but the code never surfaced
 
 ---
 
@@ -290,7 +404,7 @@ v2 structured 41 legal APIs into 89 MCP tools. v3 re-compresses them into **14 t
 
 South Korea has **1,600+ active laws**, **10,000+ administrative rules**, and a precedent system spanning Supreme Court, Constitutional Court, tax tribunals, and customs rulings. All of this lives behind a clunky government API with zero developer experience.
 
-This project wraps that entire legal system into **14 structured tools** that any AI assistant or script can call. Built by a Korean civil servant who got tired of manually searching [법제처](https://www.law.go.kr) for the hundredth time.
+This project wraps that entire legal system into **10 tools** that any AI assistant or script can call. Built by a Korean civil servant who got tired of manually searching [법제처](https://www.law.go.kr) for the hundredth time.
 
 ---
 
@@ -306,6 +420,8 @@ npx --ignore-scripts --omit=optional korean-law-mcp setup
 
 Interactive wizard handles API key input, client selection, and config file registration.
 Supports Claude Desktop, Claude Code, Cursor, VS Code, Windsurf, Gemini CLI, Zed, and Antigravity.
+Project-folder configs (Claude Code `.mcp.json`, VS Code `.vscode/mcp.json`) may be committed to git, so the key is not written in plain text:
+Claude Code gets a `${LAW_OC}` reference (add `export LAW_OC=your-key` to your shell profile), and VS Code prompts for the key on first run.
 
 **Manual setup:**
 
@@ -350,7 +466,7 @@ Get your free API key at [법제처 Open API](https://open.law.go.kr/LSO/openApi
       "args": [
         "-y",
         "mcp-remote",
-        "https://korean-law-mcp.fly.dev/mcp?oc=your-api-key"
+        "https://mcp.gomdori.app/law?oc=your-api-key"
       ]
     }
   }
@@ -363,7 +479,7 @@ Get your free API key at [법제처 Open API](https://open.law.go.kr/LSO/openApi
 {
   "mcpServers": {
     "korean-law": {
-      "url": "https://korean-law-mcp.fly.dev/mcp?oc=your-api-key"
+      "url": "https://mcp.gomdori.app/law?oc=your-api-key"
     }
   }
 }
@@ -417,7 +533,7 @@ v4.4.0 consolidated the advertised tools (52% context reduction). The former 8 `
 | **Analysis** (1) | `legal_analysis` | Verification & analysis — pick one of 4 `mode` values |
 | **Law** (3) | `search_law` | Search statutes → get lawId, MST |
 | | `get_law_text` | Full article text retrieval |
-| | `get_annexes` | Annex/form retrieval (fee tables, rate tables, forms) |
+| | `get_annexes` | Annex/form retrieval (fee tables, rate tables, forms; `date` for the version in force that day) |
 | **Ordinance** (1) | `ordinance_radar` | Ordinance revision radar — auto-diffs the parent statutes a local ordinance cites (v4.7.0) |
 | **Unified** (2) | `search_decisions` | **18 domain** unified search (precedents, constitutional court, tax tribunal, NTS, FTC, NLRC, customs, interpretations, admin appeals, PIPC, ACR, ACR special, appeal review, school rules, public corps, public institutions, treaties, English law) |
 | | `get_decision_text` | **18 domain** full text retrieval |
@@ -453,7 +569,7 @@ User: "산업안전보건법 별표1 내용"
 - **Annex Extraction** — Downloads HWPX/HWP/PDF/XLSX/DOCX annexes and converts to Markdown ([kordoc](https://github.com/chrisryugj/kordoc) engine)
 - **8 Chain Tools** — Composite research workflows in a single call (e.g. `chain_full_research`: AI search → statutes → precedents → interpretations)
 - **Caching** — 1-hour search cache, 24-hour article cache
-- **Remote Endpoint** — Use without installation via `https://korean-law-mcp.fly.dev/mcp`
+- **Remote Endpoint** — Use without installation via `https://mcp.gomdori.app/law` (the legacy `korean-law-mcp.fly.dev/mcp` stays backward compatible)
 
 ---
 
@@ -470,6 +586,7 @@ User: "산업안전보건법 별표1 내용"
 | `MCP_ALLOW_UNAUTHENTICATED_REMOTE` | No | `0` | Set to `1` only for a deliberately public, non-loopback deployment without MCP access authentication |
 | `TRUST_PROXY` | No | `false` | Set to a positive proxy-hop count (for example `1` behind one Fly/ingress proxy). Never use `true`/`all` |
 | `ALLOW_QUERY_API_KEY` | No | `1` | Set to `0` to reject the `?oc=` query-string API key (it leaks into proxy access logs) |
+| `ACCESS_LOG` | No | `0` | Set to `1` to log each request. Only `req.path` is recorded, never the query string, so the `oc=` key never reaches the log |
 | `RATE_LIMIT_RPM` | No | 60 | Tool calls per minute per IP. `0` disables only the per-IP limiter; batch and execution limits remain active |
 | `MCP_MAX_BATCH_CALLS` | No | 20 | Maximum `tools/call` items in one JSON-RPC HTTP envelope |
 | `MCP_MAX_BODY_BYTES` | No | 102400 | Maximum incoming JSON request size. The older `MCP_BODY_LIMIT` (`100kb`, etc.) is accepted for compatibility |
@@ -494,6 +611,20 @@ MCP_HTTP_HOST=0.0.0.0 TRUST_PROXY=1 MCP_AUTH_TOKEN=replace-with-a-secret \
 ### Dependency and install boundary
 
 `kordoc` remains because annex parsing is a reachable server feature. Its known-good pure-JS `pdfjs-dist@4.10.38` runtime is pinned as a normal dependency; optional OCR/ML/native helpers are not needed by this server. Plugin, documented, and Docker installs use `--omit=optional --ignore-scripts`. CI and publishing retain optional development-tool bindings with scripts disabled during validation, then prune to the production graph and run the PDF annex smoke test. Scanner reports for transitive HTTP-framework packages should be evaluated against the reachable server path rather than treated as proof that the server exposes the affected middleware.
+
+## FAQ
+
+**How do I search Korean statutes and court precedents from Claude or ChatGPT?**
+Connect this MCP server. In Claude.ai, add `https://mcp.gomdori.app/law?oc=YOUR_KEY` as a custom connector. For Claude Desktop, Cursor, Windsurf and Zed see [Quick Start](#quick-start); for ChatGPT see the [connection video](https://youtu.be/KCFIzervxtE) (Korean narration).
+
+**Is it free?**
+Yes. The code is MIT-licensed, and the 법제처 Open API key it needs is free ([open.law.go.kr](https://open.law.go.kr/LSO/openApi/guideResult.do)).
+
+**Can it catch legal citations an LLM made up?**
+`legal_analysis(mode="verify_citations")` checks the statute articles and case numbers cited in a text against the official 법제처 source, for existence and for content. `mode="cite_check"` tells whether a precedent is still good law.
+
+**What does it cover?**
+Statutes, precedents, administrative rules, local ordinances, treaties and legal interpretations (including the National Tax Service), plus annexes and forms. It also resolves past versions of a law and points repealed statutes to their successors.
 
 ## Documentation
 

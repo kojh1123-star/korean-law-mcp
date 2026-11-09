@@ -6,7 +6,7 @@ import { z } from "zod"
 import type { LawApiClient } from "../lib/api-client.js"
 import { getPrecedentText } from "./precedents.js"
 import { truncateResponse } from "../lib/schemas.js"
-import { formatToolError } from "../lib/errors.js"
+import { ErrorCodes, LawApiError, formatToolError } from "../lib/errors.js"
 
 export const SummarizePrecedentSchema = z.object({
   id: z.string().describe("판례일련번호"),
@@ -28,7 +28,11 @@ export async function summarizePrecedent(
     // 1. 판례 전문 조회
     const precedentResult = await getPrecedentText(apiClient, { id: input.id, apiKey: input.apiKey })
 
-    if (precedentResult.isError || precedentResult.content.length === 0) {
+    // 조회 실패는 원래 라벨 그대로 돌려준다. [UPSTREAM_NO_DATA]·[RATE_LIMITED]·API 오류를 "[NOT_FOUND] 판례를
+    // 찾을 수 없습니다"로 덮으면 실재하는 판례를 없다고 단정하게 된다 (2026-09-23 리뷰 D8, errors.ts UPSTREAM_NO_DATA).
+    if (precedentResult.isError) return precedentResult
+
+    if (precedentResult.content.length === 0) {
       return {
         content: [{
           type: "text",
@@ -76,16 +80,18 @@ function extractPrecedentSummary(fullText: string, maxLength: number): string {
     const trimmed = line.trim()
 
     // 섹션 구분
-    if (trimmed.includes("사건번호:") || trimmed.startsWith("사건:")) {
+    if (!sections.caseNumber && (trimmed.startsWith("사건번호:") || trimmed.startsWith("사건:"))) {
       sections.caseNumber = trimmed
-    } else if (trimmed.includes("법원:") || trimmed.includes("선고:")) {
+    } else if (!sections.court && (trimmed.startsWith("법원:") || trimmed.startsWith("선고:"))) {
       sections.court = trimmed
-    } else if (trimmed === "【판시사항】" || trimmed.startsWith("판시사항")) {
+    } else if (trimmed === "【판시사항】" || trimmed === "판시사항:") {
       currentSection = "judgment"
-    } else if (trimmed === "【판결요지】" || trimmed.startsWith("판결요지")) {
+    } else if (trimmed === "【판결요지】" || trimmed === "판결요지:") {
       currentSection = "summary"
-    } else if (trimmed === "【주문】" || trimmed.startsWith("주문")) {
+    } else if (trimmed === "【주문】" || trimmed === "주문:") {
       currentSection = "mainText"
+    } else if (/^【[^】]+】$/.test(trimmed) || ["참조조문:", "참조판례:", "전문:", "이유:"].includes(trimmed)) {
+      currentSection = ""
     } else if (currentSection === "judgment" && trimmed.length > 0) {
       sections.judgment += trimmed + "\n"
     } else if (currentSection === "summary" && trimmed.length > 0) {
@@ -93,6 +99,10 @@ function extractPrecedentSummary(fullText: string, maxLength: number): string {
     } else if (currentSection === "mainText" && trimmed.length > 0) {
       sections.mainText += trimmed + "\n"
     }
+  }
+
+  if (!sections.judgment && !sections.summary && !sections.mainText) {
+    throw new LawApiError("판시사항·판결요지·주문을 확인하지 못해 판례 요약을 만들 수 없습니다. 판결문 전문을 확인하세요.", ErrorCodes.UPSTREAM_NO_DATA)
   }
 
   // 요약 생성

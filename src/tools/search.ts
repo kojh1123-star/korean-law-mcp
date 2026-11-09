@@ -7,10 +7,11 @@ import type { LawApiClient } from "../lib/api-client.js"
 import { lawCache } from "../lib/cache.js"
 import { truncateResponse } from "../lib/schemas.js"
 import { formatToolError } from "../lib/errors.js"
-import { expandLawQuery, normalizeAliasKey, resolveLawAlias } from "../lib/search-normalizer.js"
-import { formatHit, hasRelatedHit, parseLawsXml, type LawHit } from "./search-hits.js"
-import { buildUpcomingNotes, fetchUpcomingLaws } from "../lib/upcoming-laws.js"
+import { expandLawQuery } from "../lib/search-normalizer.js"
+import { formatHit, hasRelatedHit, parseLawsXml, sortCurrentFirst, splitExactPartial } from "./search-hits.js"
+import { buildUpcomingNotes, fetchUpcomingLaws, UPCOMING_CHECK_FAILED_NOTE } from "../lib/upcoming-laws.js"
 import { searchLawFallbacks } from "./search-fallbacks.js"
+import { findFormerName } from "../lib/law-lineage.js"
 
 export const SearchLawSchema = z.object({
   query: z.string().describe("검색할 법령명 (예: '관세법', 'fta특례법', '화관법')"),
@@ -51,13 +52,19 @@ export async function searchLaw(
     }
 
     const upstreamDisplay = Math.max(input.display, UPSTREAM_DISPLAY_FLOOR)
+    // 시행예정 보조검색은 주 검색과 독립이라 같이 출발시킨다. 종전엔 주 검색이 끝난 뒤에야
+    // 시작해 캐시 미스마다 왕복 1회가 더 붙었다(2026-09-23 리뷰 A3). 0건 폴백에도 이 약속을
+    // 넘겨 같은 eflaw 검색을 두 번 치지 않는다. catch 는 주 검색이 먼저 실패할 때 미처리 거부 방지용.
+    const upcomingForQuery = fetchUpcomingLaws(apiClient, input.query, input.apiKey)
+    upcomingForQuery.catch(() => {})
     let xmlText = await apiClient.searchLaw(input.query, input.apiKey, upstreamDisplay)
     let laws = parseLawsXml(xmlText)
     let usedQuery = input.query
 
     // 0건이면 약칭/오타 확장 쿼리로 자동 재시도
     if (laws.length === 0) {
-      const { expanded } = expandLawQuery(input.query)
+      // LexDiff 원본 정규식의 공백 백트래킹 회피 (api-client.searchLaw 와 같은 이유, 리뷰 C3)
+      const { expanded } = expandLawQuery(input.query.replace(/\s+/gu, " "))
       for (const expandedQuery of expanded) {
         if (expandedQuery === input.query) continue
         const candidateXml = await apiClient.searchLaw(expandedQuery, input.apiKey, upstreamDisplay)
@@ -73,33 +80,11 @@ export async function searchLaw(
     }
 
     if (laws.length === 0) {
-      return await searchLawFallbacks(apiClient, input)
+      return await searchLawFallbacks(apiClient, input, upcomingForQuery)
     }
 
-    // 정확매칭 분리: 법제처 API는 LIKE 검색 + 가나다순 정렬이라
-    // "상법"같이 짧은 법령명은 "보상법/배상법/기상법" 등에 묻혀버림.
-    // 법령명/약칭이 사용자 입력(또는 canonical alias)과 정확히 같으면 우선 노출.
-    const queryKey = normalizeAliasKey(input.query)
-    const canonicalKey = normalizeAliasKey(resolveLawAlias(input.query).canonical)
-
-    // 현행 우선 정렬: 연혁(과거버전) 법령이 정확매칭 첫 항목으로 노출되면
-    // LLM이 옛 조문을 현행으로 오인해 답변하는 사고가 남 (소방시설법 분법 사례).
-    laws.sort((a, b) => {
-      const rank = (h: LawHit) => h.statusCode === "연혁" ? 1 : 0
-      return rank(a) - rank(b)
-    })
-
-    const exact: LawHit[] = []
-    const partial: LawHit[] = []
-    for (const h of laws) {
-      const nameKey = normalizeAliasKey(h.name)
-      const abbrKey = h.abbr ? normalizeAliasKey(h.abbr) : ""
-      const isExact = nameKey === queryKey
-        || nameKey === canonicalKey
-        || (abbrKey && (abbrKey === queryKey || abbrKey === canonicalKey))
-      if (isExact) exact.push(h)
-      else partial.push(h)
-    }
+    // 현행 우선 정렬 + 정확매칭 분리 (판정은 search-hits.ts — search_law_bulk 와 공용)
+    const { exact, partial } = splitExactPartial(sortCurrentFirst(laws), input.query)
 
     // display는 여기서 — 정확/부분 분리를 마친 "결과"에 적용한다 (#89).
     const exactShown = Math.min(exact.length, input.display)
@@ -135,9 +120,11 @@ export async function searchLaw(
 
     // 시행예정 병기: 제명변경 개정(구명칭→신명칭)이 공포~시행 사이면 신명칭 검색 시
     // "정확매칭 없음"만 떠서 LLM이 "법령 없음"으로 오판 → 신·구 명칭 매핑을 명시
-    const upcoming = await fetchUpcomingLaws(apiClient, usedQuery, input.apiKey)
-    const upcomingNotes = buildUpcomingNotes(laws, upcoming)
-    if (upcomingNotes) resultText += upcomingNotes
+    const upcoming = usedQuery === input.query
+      ? await upcomingForQuery
+      : await fetchUpcomingLaws(apiClient, usedQuery, input.apiKey)
+    if (upcoming === null) resultText += UPCOMING_CHECK_FAILED_NOTE
+    else resultText += buildUpcomingNotes(laws, upcoming)
 
     // 다음 단계 힌트: 정확매칭이 있으면 그 첫 항목, 없으면 부분매칭 첫 항목 안내
     const primary = exact[0] || partial[0]
@@ -148,12 +135,22 @@ export async function searchLaw(
       }
     }
     if (exact.length === 0 && laws.length > 0) {
-      resultText += `⚠️ 정확매칭 없음 — 법제처 API의 부분 LIKE 검색 특성상 위 결과는 법령명에 "${input.query}"가 포함된 모든 법령입니다. 의도한 법령이 없으면 정식 법령명으로 재검색하세요.\n`
+      // 옛 법령명으로 찾으면 현행 검색은 부분매칭만 준다. 연혁 검색에서 그 이름의 법령ID를 찾아 현행 명칭을 알린다.
+      // 법령명 꼴(…법·법률·령·규칙)일 때만 — "건축허가" 같은 키워드 검색마다 한 번 더 치지 않게
+      const former = /(법|법률|령|규칙|규정)$/.test(input.query.trim()) ? await findFormerName(apiClient, input.query, input.apiKey) : undefined
+      const renamedTo = former ? laws.find(l => l.lawId === former.lawId && l.statusCode !== "연혁") ?? laws.find(l => l.lawId === former.lawId) : undefined
+      if (former && renamedTo) {
+        resultText += `📛 「${former.matchedName}」은(는) 옛 법령명입니다 — 제명이 바뀌어 현행은 「${renamedTo.name}」(법령ID ${renamedTo.lawId}, MST ${renamedTo.mst})입니다. ` +
+          `옛 이름 시절 조문은 legal_analysis(mode="applicable_law", lawName, date), 별표는 get_annexes(date)로 봅니다.\n`
+      } else {
+        resultText += `⚠️ 정확매칭 없음 — 법제처 API의 부분 LIKE 검색 특성상 위 결과는 법령명에 "${input.query}"가 포함된 모든 법령입니다. 의도한 법령이 없으면 정식 법령명으로 재검색하세요.\n`
+      }
     }
 
-    // Cache the result (1 hour TTL)
+    // 1시간 캐시. 시행예정 확인이 실패한 결과는 1분만 둔다: 1시간 두면 업스트림이 돌아와도
+    // "확인 실패" 응답이 한 시간 동안 같은 쿼리의 모든 사용자에게 나간다(리뷰 A4).
     const truncated = truncateResponse(resultText)
-    lawCache.set(cacheKey, truncated, 60 * 60 * 1000)
+    lawCache.set(cacheKey, truncated, upcoming === null ? 60 * 1000 : 60 * 60 * 1000)
 
     return {
       content: [{

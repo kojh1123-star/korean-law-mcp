@@ -17,7 +17,12 @@ function fmt(d: Date): string {
 /** 오늘 기준 N개월 전 */
 function monthsAgo(n: number, base: Date = new Date()): Date {
   const d = new Date(base)
+  const day = d.getDate()
+  // 월말에서 짧은 달로 이동하면 setMonth가 다음 달로 넘기므로 1일에서 이동 후 보정한다.
+  d.setDate(1)
   d.setMonth(d.getMonth() - n)
+  const lastDay = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate()
+  d.setDate(Math.min(day, lastDay))
   return d
 }
 

@@ -3,6 +3,7 @@ import type { LawApiClient } from "../lib/api-client.js";
 import { parseTaxTribunalXML } from "../lib/xml-parser.js";
 import { truncateResponse } from "../lib/schemas.js";
 import { formatToolError, noResultHint } from "../lib/errors.js";
+import { decisionFields } from "../lib/decision-fields.js";
 
 // ========================================
 // Common helpers (소청심사위원회 + 국민권익위 특별행정심판 공통)
@@ -92,7 +93,7 @@ async function getSpecialAppealText(
       throw new Error(`${label}을(를) 찾을 수 없거나 응답 형식이 올바르지 않습니다.`);
     }
 
-    const decc = data.SpecialDeccService;
+    const decc = decisionFields(data.SpecialDeccService);
     let output = `=== ${decc.사건명 || label} ===\n\n`;
 
     output += `기본 정보:\n`;
@@ -111,7 +112,8 @@ async function getSpecialAppealText(
     if (decc.이유) output += `이유:\n${decc.이유}\n\n`;
     if (decc.따른결정) output += `따른결정:\n${decc.따른결정}\n\n`;
     if (decc.참조결정) output += `참조결정:\n${decc.참조결정}\n\n`;
-    if (decc.관련법령) output += `관련법령:\n${decc.관련법령}\n`;
+    const legalGrounds = decc.관련법령 || decc.관계법령;
+    if (legalGrounds) output += `관련법령:\n${legalGrounds}\n`;
 
     return { content: [{ type: "text", text: truncateResponse(output) }] };
   } catch (error) {

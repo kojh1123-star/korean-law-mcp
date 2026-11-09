@@ -16,6 +16,8 @@
  * 안전성: 모든 함수는 매칭 실패 / 빈 입력 / 짧은 입력 시 **원본 그대로 반환**.
  */
 
+import { sliceWellFormed } from "./truncate-text.js"
+
 export interface CompactOptions {
   /** true 시 축약 비활성 → 원본 반환 */
   full?: boolean
@@ -48,42 +50,55 @@ export function compactBody(text: string, opts: CompactOptions = {}): string {
   const headBoundaries = [
     headRaw.lastIndexOf("다.\n"),
     headRaw.lastIndexOf("라.\n"),
-    headRaw.lastIndexOf("다. "),
-    headRaw.lastIndexOf("라. "),
+    lastSentenceEnd(headRaw, "다. "),
+    lastSentenceEnd(headRaw, "라. "),
     headRaw.lastIndexOf(".\n\n"),
     headRaw.lastIndexOf("\n\n"),
-    headRaw.lastIndexOf(". "),
+    lastSentenceEnd(headRaw, ". "),
   ]
   const headCutCandidate = Math.max(...headBoundaries)
   const headCut = headCutCandidate > HEAD * 0.5 ? headCutCandidate + 2 : HEAD
-  const head = text.slice(0, headCut).trimEnd()
+  // 2026-09-23 리뷰 C10: 경계가 없으면 HEAD 자리에서 하드컷한다. 그 자리가 서로게이트 쌍 한가운데면
+  // lone surrogate 가 남아 JSON 직렬화에서 U+FFFD 로 변형된다(#150 과 같은 유형). 쌍 앞에서 끊는다.
+  const head = sliceWellFormed(text, headCut).trimEnd()
 
   // TAIL — 뒤에서 TAIL자 범위 중 문장 시작에서 자르기
   // ". " 경계는 소수점("1,234.00 원")/영문 약어("No. 3") 오탐 위험으로 제외.
   // 판례 한국어 특성상 "다." / "라." 종결어미가 지배적이라 이걸로 충분.
   const tailStart = text.length - TAIL
   const tailRaw = text.slice(tailStart)
-  const tailBoundaryIdx = [
-    tailRaw.indexOf("\n\n"),
-    tailRaw.indexOf("다.\n"),
-    tailRaw.indexOf("라.\n"),
-    tailRaw.indexOf("다. "),
-    tailRaw.indexOf("라. "),
-    tailRaw.indexOf("한다. "),
-  ]
-    .filter((i) => i >= 0)
-    .sort((a, b) => a - b)[0]
+  // 꼬리는 경계 패턴 **뒤**에서 시작한다. 길이와 무관하게 +2 하면 "한다. " 경계에서 꼬리가
+  // ". 그런데…" 로 시작했다(2026-10-01 감사 실측 616245·620409)
+  const tailBoundary = ["\n\n", "다.\n", "라.\n", "다. ", "라. ", "한다. "]
+    .map((b) => ({ idx: tailRaw.indexOf(b), len: b.length }))
+    .filter((b) => b.idx >= 0)
+    .sort((a, b) => a.idx - b.idx)[0]
 
-  const tailFrom =
-    tailBoundaryIdx !== undefined && tailBoundaryIdx < TAIL * 0.5
-      ? tailStart + tailBoundaryIdx + 2
+  let tailFrom =
+    tailBoundary !== undefined && tailBoundary.idx < TAIL * 0.5
+      ? tailStart + tailBoundary.idx + tailBoundary.len
       : tailStart
+  // 같은 이유로 꼬리 시작이 low surrogate 면 한 칸 당겨 온전한 글자로 시작한다 (리뷰 C10)
+  const firstUnit = text.charCodeAt(tailFrom)
+  if (firstUnit >= 0xdc00 && firstUnit <= 0xdfff) tailFrom--
   const tail = text.slice(tailFrom).trimStart()
 
   const omitted = text.length - head.length - tail.length
   if (omitted < MIN_SAVE) return text // 실질 절감 미달 시 원본
 
   return `${head}\n\n⋯ 중략 ${omitted.toLocaleString()}자 (full=true로 전문 조회) ⋯\n\n${tail}`
+}
+
+/**
+ * 마침표 경계 pattern 의 마지막 위치. 번호 뒤의 마침표는 문장 끝이 아니라 건너뛴다(2026-10-01 감사 실측 616245):
+ * 숫자 뒤(날짜 "2020. 12. 28."·번호 "1.")와 줄 머리 항목 기호("\n라. 소외 조합은").
+ * 경계로 치면 가장 뒤라서 "다. " 를 이기고 머리가 "…소외 조합은 2020. 12. 28." 이나 "…제출하였다.\n라." 에서 끝났다.
+ */
+function lastSentenceEnd(s: string, pattern: string): number {
+  const dot = pattern.indexOf(".")
+  let i = s.lastIndexOf(pattern)
+  while (i > 0 && (/\d/.test(s[i + dot - 1]) || s[i + dot - 2] === "\n")) i = s.lastIndexOf(pattern, i - 1)
+  return i
 }
 
 /**
@@ -142,7 +157,9 @@ export function densifyPrecedentRefs(text: string): string {
     // (문서 중간 "제2020." 같은 오탐 방지)
     .replace(/(^|[\s,(\[;/])(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})\./g, "$1$2.$3.$4.")
     // "[동지] ", "[공보 생략]" 같은 부가표기 제거
-    .replace(/\s*\[[^\]]{2,15}\]\s*/g, " ")
+    // 2026-09-23 리뷰 C10: 판시사항 번호 표식 [10] 이상도 2자 이상이라 함께 지워졌다([1]~[9]만 남음).
+    // 숫자만 든 괄호는 남긴다.
+    .replace(/\s*\[(?!\d+\])[^\]]{2,15}\]\s*/g, " ")
     // 연속 공백
     .replace(/[ \t]{2,}/g, " ")
     .replace(/\s*,\s*/g, ", ")
@@ -228,22 +245,21 @@ const KNOWN_SECTION_HEADERS = [
   "조문내용",
 ]
 
+// These rendered fields end a body section, but must never be shortened with it.
+const PROTECTED_SECTION_HEADERS = [
+  "판시사항", "판결요지", "결정요지", "재결요지", "주문", "청구취지", "질의요지",
+  "참조조문", "참조판례", "관련법령", "관계법령", "따른결정", "참조결정", "판정사항",
+]
+
 export function compactLongSections(text: string): string {
   if (!text || text.length < 1500) return text
   // 이미 축약된 경우 skip
   if (text.includes("⋯ 중략 ") && text.includes("(full=true로 전문 조회)")) return text
 
-  const pattern = new RegExp(`\\n(${KNOWN_SECTION_HEADERS.join("|")}):\\n`, "g")
-  let lastMatch: RegExpExecArray | null = null
-  let m: RegExpExecArray | null
-  while ((m = pattern.exec(text)) !== null) {
-    lastMatch = m
-  }
-  if (!lastMatch) return text
-
-  const sectionStart = lastMatch.index + lastMatch[0].length
-  const body = text.slice(sectionStart)
-  const compacted = compactBody(body, { full: false })
-  if (compacted === body) return text
-  return text.slice(0, sectionStart) + compacted
+  const headers = [...KNOWN_SECTION_HEADERS, ...PROTECTED_SECTION_HEADERS].join("|")
+  const pattern = new RegExp(`\\n(${headers}):\\n([\\s\\S]*?)(?=\\n(?:${headers}):\\n|$)`, "g")
+  return text.replace(pattern, (section, header: string, body: string) => {
+    if (!KNOWN_SECTION_HEADERS.includes(header)) return section
+    return `\n${header}:\n${compactBody(body, { full: false })}`
+  })
 }

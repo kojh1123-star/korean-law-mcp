@@ -11,7 +11,7 @@ import { formatToolError } from "../lib/errors.js"
 import { escapeRegex } from "../lib/escape-regex.js"
 
 export const FindSimilarPrecedentsSchema = z.object({
-  query: z.string().describe("검색 키워드 또는 판례 내용"),
+  query: z.string().describe("검색 키워드 또는 판례 내용 (발췌는 2,000자 이내: 서버 공통 인자 상한)"),
   display: z.number().optional().default(5).describe("최대 결과 개수 (기본값: 5)"),
   apiKey: z.string().optional().describe("법제처 Open API 인증키(OC). 사용자가 제공한 경우 전달")
 })
@@ -109,6 +109,8 @@ function rankByKeywordSimilarity(searchResultText: string, keywords: string[], m
   let currentScore = 0
 
   for (const line of lines) {
+    // 검색 보정·후속 호출 안내는 판례 메타데이터가 아니다. 마지막 항목의 점수를 부풀리지 않는다.
+    if (/^(?:검색 보정:|💡)/.test(line)) break
     // searchPrecedents 출력 형식: "[일련번호] 판례명" 또는 "N. " 형식
     if (line.match(/^\[\d+\]\s/) || line.match(/^\d+\.\s/)) {
       if (currentPrecedent) {
