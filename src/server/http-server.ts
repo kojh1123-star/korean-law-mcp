@@ -61,6 +61,21 @@ export function exceedsBatchLimit(body: unknown, maxBatchCalls: number): boolean
   return countToolCalls(body) > maxBatchCalls
 }
 
+/** 로그용 봉투 요약: method 와 id·params 의 '타입'만 싣는다(값은 안 싣는다) */
+export function describeEnvelope(body: unknown): string {
+  const messages = Array.isArray(body) ? body : [body]
+  const typeOf = (v: unknown) => (v === null ? "null" : Array.isArray(v) ? "array" : typeof v)
+  const one = (m: unknown): string => {
+    if (typeof m !== "object" || m === null) return typeOf(m)
+    const r = m as Record<string, unknown>
+    // method 는 클라이언트가 보낸 문자열이라 개행을 넣어 로그 줄을 위조할 수 있다: 안전한 문자만 남긴다
+    const kind = typeof r.method === "string" ? r.method.slice(0, 40).replace(/[^\w/.:-]/g, "?") : ("result" in r || "error" in r) ? "response" : "?"
+    return `${kind}(id:${typeOf(r.id)},params:${typeOf(r.params)})`
+  }
+  const head = messages.slice(0, 3).map(one).join(" ")
+  return messages.length > 3 ? `${head} +${messages.length - 3}` : head
+}
+
 export async function startHTTPServer(
   createServer: (executionLimits: ExecutionLimits) => Server,
   port: number,
@@ -251,7 +266,7 @@ export async function startHTTPServer(
   // 보안 헤더 (Access-Control-Allow-Origin은 위 Origin 검증 미들웨어가 설정)
   app.use((req, res, next) => {
     res.header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-    res.header("Access-Control-Allow-Headers", "Content-Type, mcp-session-id, last-event-id, apikey, x-api-key, x-mcp-token, authorization")
+    res.header("Access-Control-Allow-Headers", "Content-Type, mcp-protocol-version, mcp-session-id, last-event-id, apikey, law_oc, law-oc, x-law-oc, x-api-key, x-mcp-token, authorization")
     res.header("X-Content-Type-Options", "nosniff")
     res.header("X-Frame-Options", "DENY")
     res.header("Referrer-Policy", "strict-origin-when-cross-origin")
@@ -324,9 +339,11 @@ export async function startHTTPServer(
     // ALLOW_QUERY_API_KEY=0 으로 쿼리 경로를 차단할 수 있다 (폐쇄망 권장).
     // 인증이 켜진 경우 Authorization 헤더는 접근 토큰이므로 법제처 키로 오인하면 안 된다.
     const authHeader = bearerValue(req.headers["authorization"] as string | undefined)
+    // Set by the auth middleware for both the legacy token and employee OAuth
+    // tokens; either kind of Bearer value must never be forwarded as a law key.
     const authHeaderIsAccessToken = res.locals.mcpAccessAuthenticated === true
-    const queryKey = process.env.ALLOW_QUERY_API_KEY === "0" ? undefined : (req.query.oc as string | undefined)
-    const apiKey =
+    const queryKey = process.env.ALLOW_QUERY_API_KEY === "0" ? undefined : req.query.oc
+    const candidateApiKey =
       (req.headers["apikey"] as string | undefined) ||
       (req.headers["law_oc"] as string | undefined) ||
       (req.headers["law-oc"] as string | undefined) ||
@@ -334,6 +351,18 @@ export async function startHTTPServer(
       (authHeaderIsAccessToken ? undefined : authHeader || undefined) ||
       (req.headers["x-law-oc"] as string | undefined) ||
       queryKey
+
+    // Repeated query parameters are arrays in Express. They must not bypass
+    // the fallback gate or enter a context whose consumers expect a string.
+    if (candidateApiKey !== undefined && typeof candidateApiKey !== "string") {
+      res.status(400).json({
+        jsonrpc: "2.0",
+        error: { code: -32600, message: "API key must be a single string." },
+        id: null,
+      })
+      return
+    }
+    const apiKey = candidateApiKey
 
     // 자체 키 없는 요청은 서버 LAW_OC로 폴백 — 전역 상한 적용
     // initialize/tools/list 등 핸드셰이크는 법제처 쿼터를 안 쓰므로 tools/call만 게이트
@@ -369,6 +398,13 @@ export async function startHTTPServer(
         sessionIdGenerator: undefined,  // ← stateless 모드
         enableJsonResponse: true,
       })
+      // SDK 가 요청을 거절한 사유(400 등)는 onerror 로만 나온다. 안 받으면 로그엔 launcher 의
+      // `[edge] … -> 400` 만 남아 원인을 가를 수 없다. 2026-09-23 실측: claude.ai 커넥터 POST 의
+      // 약 15% 가 400 이었고 직후 재초기화로 성공하는 패턴이었다(사유 미상).
+      server.onerror = (error) => {
+        const pv = String(req.headers["mcp-protocol-version"] ?? "-").slice(0, 40)
+        console.error(`[mcp] ${scrubError(error).message.replace(/\s+/g, " ").slice(0, 200)} body=${describeEnvelope(req.body)} pv=${pv} ua="${req.headers["user-agent"] ?? "-"}"`)
+      }
 
       // Disconnecting the HTTP client must stop its upstream work.  This is
       // deliberately separate from MCP's item cancellation signal: sibling

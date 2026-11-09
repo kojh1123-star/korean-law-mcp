@@ -3,13 +3,27 @@ import type { LawApiClient } from "../lib/api-client.js";
 import { truncateResponse } from "../lib/schemas.js";
 import { parseSearchXML, extractTag } from "../lib/xml-parser.js";
 import { formatToolError, noResultHint } from "../lib/errors.js";
+import { decisionFields } from "../lib/decision-fields.js";
 
-// 관세청(kcsCgmExpc)·국세청(ntsCgmExpc) 응답 구조가 동일하므로 target만 분기해 재사용
-type CgmExpcTarget = "kcsCgmExpc" | "ntsCgmExpc";
+// 관세청(kcsCgmExpc)·국세청(ntsCgmExpc)·고용노동부(moelCgmExpc) 중앙부처 1차 해석은
+// 응답 구조(CgmExpc/cgmExpc, CgmExpcService)가 동일하므로 target만 분기해 재사용
+type CgmExpcTarget = "kcsCgmExpc" | "ntsCgmExpc" | "moelCgmExpc";
 const TARGET_LABEL: Record<CgmExpcTarget, string> = {
   kcsCgmExpc: "관세청",
   ntsCgmExpc: "국세청",
+  moelCgmExpc: "고용노동부",
 };
+const TOOL_NAMES: Record<CgmExpcTarget, { search: string; text: string }> = {
+  kcsCgmExpc: { search: "search_customs_interpretations", text: "get_customs_interpretation_text" },
+  ntsCgmExpc: { search: "search_nts_interpretations", text: "get_nts_interpretation_text" },
+  moelCgmExpc: { search: "search_moel_interpretations", text: "get_moel_interpretation_text" },
+};
+
+/** 검색범위 search(1=안건명 기본, 2=본문). options 경유로 문자열 "2"가 올 수 있다 */
+function normalizeSearchScope(value: unknown): string | undefined {
+  const text = typeof value === "number" ? String(Math.trunc(value)) : typeof value === "string" ? value.trim() : ""
+  return text === "1" || text === "2" ? text : undefined
+}
 
 // Customs legal interpretation search tool - Search for customs law interpretations
 export const searchCustomsInterpretationsSchema = z.object({
@@ -22,6 +36,8 @@ export const searchCustomsInterpretationsSchema = z.object({
   explYd: z.string().optional().describe("Interpretation date range (YYYYMMDD~YYYYMMDD, e.g., '20200101~20201231')"),
   sort: z.enum(["lasc", "ldes", "dasc", "ddes"]).optional()
     .describe("Sort option: lasc/ldes (interpretation name), dasc/ddes (interpretation date)"),
+  search: z.union([z.number(), z.string()]).optional()
+    .describe("Search scope: 1=안건명 (default), 2=본문"),
   apiKey: z.string().optional().describe("법제처 Open API 인증키(OC). 사용자가 제공한 경우 전달"),
 });
 
@@ -42,6 +58,14 @@ export async function searchNtsInterpretations(
   return searchCgmExpcByTarget(apiClient, args, "ntsCgmExpc");
 }
 
+/** 고용노동부 법령해석(질의회시) 검색 — 응답 구조 관세청과 동일, target만 분기. unified-decisions만 사용 */
+export async function searchMoelInterpretations(
+  apiClient: LawApiClient,
+  args: SearchCustomsInterpretationsInput
+): Promise<{ content: Array<{ type: string, text: string }>, isError?: boolean }> {
+  return searchCgmExpcByTarget(apiClient, args, "moelCgmExpc");
+}
+
 async function searchCgmExpcByTarget(
   apiClient: LawApiClient,
   args: SearchCustomsInterpretationsInput,
@@ -59,6 +83,8 @@ async function searchCgmExpcByTarget(
     if (args.gana) extraParams.gana = args.gana;
     if (args.explYd) extraParams.explYd = args.explYd;
     if (args.sort) extraParams.sort = args.sort;
+    const searchScope = normalizeSearchScope(args.search);
+    if (searchScope) extraParams.search = searchScope;
 
     const xmlText = await apiClient.fetchApi({
       endpoint: "lawSearch.do",
@@ -73,6 +99,7 @@ async function searchCgmExpcByTarget(
       (content) => ({
         법령해석일련번호: extractTag(content, "법령해석일련번호"),
         안건명: extractTag(content, "안건명"),
+        안건번호: extractTag(content, "안건번호"),
         질의기관코드: extractTag(content, "질의기관코드"),
         질의기관명: extractTag(content, "질의기관명"),
         해석기관코드: extractTag(content, "해석기관코드"),
@@ -92,6 +119,7 @@ async function searchCgmExpcByTarget(
 
     for (const expc of expcs) {
       output += `[${expc.법령해석일련번호}] ${expc.안건명}\n`;
+      if (expc.안건번호) output += `  안건번호: ${expc.안건번호}\n`;
       output += `  질의기관: ${expc.질의기관명 || "N/A"}\n`;
       output += `  해석기관: ${expc.해석기관명 || "N/A"}\n`;
       output += `  해석일자: ${expc.해석일자 || "N/A"}\n`;
@@ -110,7 +138,7 @@ async function searchCgmExpcByTarget(
       }]
     };
   } catch (error) {
-    return formatToolError(error, target === "ntsCgmExpc" ? "search_nts_interpretations" : "search_customs_interpretations");
+    return formatToolError(error, TOOL_NAMES[target].search);
   }
 }
 
@@ -128,6 +156,14 @@ export async function getCustomsInterpretationText(
   args: GetCustomsInterpretationTextInput
 ): Promise<{ content: Array<{ type: string, text: string }>, isError?: boolean }> {
   return getCgmExpcTextByTarget(apiClient, args, "kcsCgmExpc");
+}
+
+/** 고용노동부 법령해석(질의회시) 본문 조회 — lawService.do?target=moelCgmExpc (CgmExpcService) */
+export async function getMoelInterpretationText(
+  apiClient: LawApiClient,
+  args: GetCustomsInterpretationTextInput
+): Promise<{ content: Array<{ type: string, text: string }>, isError?: boolean }> {
+  return getCgmExpcTextByTarget(apiClient, args, "moelCgmExpc");
 }
 
 /**
@@ -178,12 +214,13 @@ async function getCgmExpcTextByTarget(
     }
 
     if (!data.CgmExpcService) {
-      throw new Error("Customs interpretation not found or invalid response format");
+      throw new Error(`${TARGET_LABEL[target]} interpretation not found or invalid response format`);
     }
 
-    const expc = data.CgmExpcService;
+    const expc = decisionFields(data.CgmExpcService);
     const basic = {
       안건명: expc.안건명,
+      안건번호: expc.안건번호,
       법령해석일련번호: expc.법령해석일련번호,
       업무분야: expc.업무분야,
       해석일자: expc.해석일자,
@@ -199,10 +236,11 @@ async function getCgmExpcTextByTarget(
       관세법령정보포털원문링크: expc.관세법령정보포털원문링크
     };
 
-    let output = `=== ${basic.안건명 || "Customs Interpretation"} ===\n\n`;
+    let output = `=== ${basic.안건명 || `${TARGET_LABEL[target]} 법령해석`} ===\n\n`;
 
     output += `기본 정보:\n`;
     output += `  해석일련번호: ${basic.법령해석일련번호 || "N/A"}\n`;
+    if (basic.안건번호) output += `  안건번호: ${basic.안건번호}\n`;
     output += `  업무분야: ${basic.업무분야 || "N/A"}\n`;
     output += `  해석일자: ${basic.해석일자 || "N/A"}\n`;
     output += `  질의기관: ${basic.질의기관명 || "N/A"}\n`;
@@ -236,7 +274,6 @@ async function getCgmExpcTextByTarget(
       }]
     };
   } catch (error) {
-    return formatToolError(error, target === "ntsCgmExpc" ? "get_nts_interpretation_text" : "get_customs_interpretation_text");
+    return formatToolError(error, TOOL_NAMES[target].text);
   }
 }
-

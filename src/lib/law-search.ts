@@ -10,6 +10,8 @@ import type { LawApiClient } from "./api-client.js"
 import { lawCache } from "./cache.js"
 import { extractTag } from "./xml-parser.js"
 import { normalizeLawSearchText, resolveLawAlias } from "./search-normalizer.js"
+import { requestContext } from "./session-state.js"
+import { rethrowIfFatal } from "./fatal-errors.js"
 
 export interface LawInfo {
   lawName: string
@@ -59,7 +61,10 @@ export function resolvedLawMatches(requested: string, officialName: string): boo
 export const NON_LAW_NAME_RE = /\s*(과태료|절차|비용|처벌|기준|허가|신청|부과|근거|위반|방법|요건|조건|처분|수수료|신고|등록|면허|인가|승인|취소|정지|벌칙|벌금|과징금|이행강제금|시정명령|체계|구조|3단|판례|해석|개정|별표|시행령|시행규칙|서식|수입|수출|통관|반환|납부|감면|면제|제한|금지|의무|권리|자격|종류|기간|대상|범위|적용|감경|영향도|영향|분석|위임입법|위임|현황|미이행|미제정|시계열|타임라인|변화|처리|민원|매뉴얼|업무|담당|적합성|상위법|저촉|검증|파급|연쇄|불복|소송|쟁송|FTA|원산지|HS코드|품목분류|관세사)\s*/g
 
 export function stripNonLawKeywords(query: string): string {
-  return query.replace(NON_LAW_NAME_RE, " ").trim()
+  // 공백 연속을 먼저 하나로 뭉친다. NON_LAW_NAME_RE 양끝의 \s* 가 공백 연속에서 O(k²) 로
+  // 백트래킹해 2만 자 공백이면 impact_map·applicable_law 가 1.9초 멈췄다(2026-09-23 리뷰 C).
+  // 결과는 검색어로 쓰이고 공백 단위로 쪼개지므로 공백 개수 차이는 의미가 없다.
+  return query.replace(/\s+/g, " ").replace(NON_LAW_NAME_RE, " ").trim()
 }
 
 /** XML에서 법령 정보 파싱 */
@@ -100,6 +105,28 @@ export function scoreLawRelevance(lawName: string, query: string, queryWords: st
 }
 
 /**
+ * 요청 단위 진행 중 검색 공유 (2026-09-23 리뷰 B#3·A10).
+ *
+ * lawCache 는 검색이 끝난 뒤에야 채워지고 0건은 담지 않는다. 그래서 한 요청 안에서 동시에 도는
+ * 같은 검색(verify_citations 의 "민법 제750조, 민법 제751조 …")이 전부 캐시를 놓쳐 각자
+ * 업스트림을 쳤다: 같은 법령 인용 15건이면 동일 검색 15회로 요청 예산(48회)을 먼저 태웠다.
+ * 전역 in-flight 맵이 아니라 요청 컨텍스트(ALS 저장소)에 묶는다. 한 요청의 취소·예산 소진이
+ * 다른 요청(배치의 형제 항목 포함)의 대기를 깨뜨리면 안 되기 때문이다. 컨텍스트 밖(단독 호출)은 공유하지 않는다.
+ */
+const inflightByRequest = new WeakMap<object, Map<string, Promise<LawInfo[]>>>()
+
+function requestSearchMemo(): Map<string, Promise<LawInfo[]>> | undefined {
+  const store = requestContext.getStore()
+  if (!store) return undefined
+  let memo = inflightByRequest.get(store)
+  if (!memo) {
+    memo = new Map()
+    inflightByRequest.set(store, memo)
+  }
+  return memo
+}
+
+/**
  * 법령 검색 + 관련도 정렬 + 캐싱.
  * 1차: 원본 쿼리 → 2차: 부가키워드 제거 → 3차: 법령명 패턴 직접 추출
  * 이후 scoreLawRelevance로 정렬.
@@ -117,20 +144,72 @@ export async function findLaws(
   max = 3,
   searchDisplay = 100
 ): Promise<LawInfo[]> {
-  const cacheKey = `law-search:${query}:${max}:${searchDisplay}`
+  // 캐시에는 정렬된 전체 목록을 두고 max 는 읽을 때 자른다 — max 만 다른 호출(체인 3 · 인용 검증 5 · 계보 100)이 서로 캐시를 놓쳤다
+  const cacheKey = `law-search:${query}:${searchDisplay}`
   const cached = lawCache.get<LawInfo[]>(cacheKey)
   if (cached) return cached.slice(0, max)
 
-  const effectiveMax = Math.max(max, searchDisplay)  // 정렬 대상 전체 수집
+  // 업스트림 요청은 (query, display) 로 정해지고 max 는 정렬 뒤 자르기일 뿐이다. 그래서 공유 키에서
+  // max 를 뺀다: 같은 검색을 max 만 달리 부르는 호출(체인 기반 탐색 3 · 인용 검증 5)도 한 번으로 묶인다.
+  const memo = requestSearchMemo()
+  const memoKey = `${query}\u0000${searchDisplay}`
+  let pending = memo?.get(memoKey)
+  if (!pending) {
+    pending = searchAndRankLaws(apiClient, query, apiKey, searchDisplay)
+    memo?.set(memoKey, pending)
+  }
+  const ranked = await pending
+  if (ranked.length > 0 && !degradedResults.has(ranked)) {
+    lawCache.set(cacheKey, ranked, 60 * 60 * 1000)
+  }
+  return ranked.slice(0, max)
+}
+
+/**
+ * 앞 단계가 장애로 빠진 채 뒤 폴백 단계로 얻은 결과 — 덜 맞는 법령일 수 있어 전역 캐시에 넣지 않는다.
+ * 넣으면 일시 장애 한 번이 한 시간 동안 모든 사용자의 검색을 열화시킨다("건축법 시행령" → 건축법, 2026-09-28 리뷰).
+ */
+const degradedResults = new WeakSet<LawInfo[]>()
+
+/** findLaws 의 업스트림 단계: 3단 검색 + 관련도 정렬. 자르기(max)와 캐시 쓰기는 호출부 몫이다. */
+async function searchAndRankLaws(
+  apiClient: LawApiClient,
+  query: string,
+  apiKey: string | undefined,
+  searchDisplay: number
+): Promise<LawInfo[]> {
+  // 정렬 대상 전체 수집. 업스트림은 display 행까지만 주므로 이 상한은 사실상 "응답 전부"다
+  // (종전 Math.max(max, searchDisplay) 와 같은 결과를 max 없이 낸다).
+  const effectiveMax = Math.max(searchDisplay, 100)
 
   // 인프라 에러(타임아웃·5xx·파싱 실패)는 "법령 없음"과 구분해야 한다.
   // 삼키면 법제처 장애 중 verify_citations가 실존 조문을 NOT_FOUND로 오판한다.
   let lastInfraError: unknown
+  // 단계별 검색어(원문 → 부가어 제거 → 법령명 추출)도 요청 안에서 공유하고 결과를 캐시한다. 종전엔 바깥 검색어만 캐시돼
+  // "민법 제750조 … 민법 제751조"처럼 폴백 단계가 같은 검색어("민법")로 모이는 호출이 매번 업스트림을 쳤다(2026-09-28 성능 감사).
+  const memo = requestSearchMemo()
+  const searchOnce = (q: string): Promise<LawInfo[]> => {
+    const key = `law-search-raw:${q}:${searchDisplay}`
+    const hit = lawCache.get<LawInfo[]>(key)
+    if (hit) return Promise.resolve(hit)
+    const memoKey = `raw\u0000${q}\u0000${searchDisplay}`
+    let pending = memo?.get(memoKey)
+    if (!pending) {
+      pending = apiClient.searchLaw(q, apiKey, searchDisplay).then(xml => {
+        const rows = parseLawXml(xml, effectiveMax)
+        if (rows.length > 0) lawCache.set(key, rows, 60 * 60 * 1000)
+        return rows
+      })
+      memo?.set(memoKey, pending)
+    }
+    return pending
+  }
   const trySearch = async (q: string): Promise<LawInfo[]> => {
     try {
-      const xmlText = await apiClient.searchLaw(q, apiKey, searchDisplay)
-      return parseLawXml(xmlText, effectiveMax)
+      return await searchOnce(q)
     } catch (e) {
+      // 예산 소진·요청 취소는 다음 검색어 변형으로 넘어가 봐야 같은 결과다. 곧바로 올린다 (B#11)
+      rethrowIfFatal(e)
       if (e instanceof Error && /429|401|403|API 키/.test(e.message)) throw e
       lastInfraError = e
       return []
@@ -143,7 +222,8 @@ export async function findLaws(
   // 2차: 부가 키워드 제거
   if (results.length === 0) {
     const stripped = stripNonLawKeywords(query)
-    if (stripped && stripped !== query) {
+    // stripNonLawKeywords 가 공백을 뭉치므로 원문 그대로와 비교하면 공백만 다른 같은 검색을 한 번 더 친다
+    if (stripped && stripped !== query.replace(/\s+/g, " ").trim()) {
       results = await trySearch(stripped)
     }
   }
@@ -163,24 +243,24 @@ export async function findLaws(
       : lastInfraError
   }
 
-  // 관련도 정렬
+  if (lastInfraError !== undefined && results.length > 0) {
+    results = [...results]
+    degradedResults.add(results)
+  }
+
+  // 관련도 정렬 — 복사본을 정렬한다. results 는 단계 캐시(law-search-raw)에 든 배열 그 자체라, 제자리 정렬하면
+  // 같은 폴백 검색어로 모이는 다른 질의의 순서를 요청·사용자를 넘어 서로 흔든다(2026-09-28 리뷰 실측)
   if (results.length > 1) {
-    const queryWords = query.replace(NON_LAW_NAME_RE, " ")
-      .trim().split(/\s+/).filter(w => w.length > 0)
-    results.sort((a, b) => {
+    const queryWords = stripNonLawKeywords(query).split(/\s+/).filter(w => w.length > 0)
+    results = [...results].sort((a, b) => {
       const scoreA = scoreLawRelevance(a.lawName, query, queryWords)
       const scoreB = scoreLawRelevance(b.lawName, query, queryWords)
       return scoreB - scoreA
     })
+    if (lastInfraError !== undefined) degradedResults.add(results)
   }
 
-  // max만큼만 반환
-  const final = results.slice(0, max)
-  if (final.length > 0) {
-    lawCache.set(cacheKey, final, 60 * 60 * 1000)
-  }
-
-  return final
+  return results
 }
 
 /**
@@ -193,15 +273,18 @@ export async function findLaws(
 export function pickRepealed(rows: LawInfo[], query: string): LawInfo | undefined {
   const norm = (s: string) => s.replace(/\s+/g, "")
   const q = norm(query)
-  return rows
-    .filter((r) => r.status === "연혁"
-      && (norm(r.lawName) === q || norm(r.lawName).startsWith(q)))
-    .sort((a, b) => (b.effectiveDate || "").localeCompare(a.effectiveDate || ""))[0]
+  const latest = (list: LawInfo[]) => list.sort((a, b) => (b.effectiveDate || "").localeCompare(a.effectiveDate || ""))[0]
+  const history = rows.filter((r) => r.status === "연혁")
+  // 완전일치가 접두 일치보다 먼저다. 접두는 약칭용인데, 하위법령 꼬리("… 시행규칙")까지 받으면 법률 인용에
+  // 시행규칙을 집어 "폐지"로 답했다(2026-09-28 실측: 「소방시설 설치ㆍ유지 및 안전관리에 관한 법률」 → 그 시행규칙)
+  const exact = history.filter((r) => norm(r.lawName) === q)
+  if (exact.length > 0) return latest(exact)
+  return latest(history.filter((r) => norm(r.lawName).startsWith(q) && !/^(시행령|시행규칙)/.test(norm(r.lawName).slice(q.length))))
 }
 
 /**
  * 폐지(연혁) 법령 조회 — target=eflaw로 과거·폐지본을 검색해 최신 연혁본을 반환.
- * 현행 검색이 0건일 때만 보조로 호출(환각 vs 폐지 구분용). 실패 시 undefined.
+ * 현행 검색이 0건일 때만 보조로 호출(환각 vs 폐지 구분용). 실패 시 undefined, 예산 소진·취소는 올린다.
  */
 export async function findRepealedLaw(
   apiClient: LawApiClient,
@@ -211,7 +294,10 @@ export async function findRepealedLaw(
   let xmlText: string
   try {
     xmlText = await apiClient.searchLaw(query, apiKey, 30, "eflaw")
-  } catch {
+  } catch (error) {
+    // 예산 소진·취소는 "폐지 법령 없음"이 아니다. 삼키면 호출부(verify_citations)가 확인하지 못한 법령을
+    // ✗ NOT_FOUND(지어낸 법령)로 단정했다(2026-10-01 감사). 올려서 그 인용을 "검색 실패"(⚠)로 남긴다
+    rethrowIfFatal(error)
     return undefined  // eflaw 조회 실패는 조용히 폴백(기존 NOT_FOUND 경로 유지)
   }
   return pickRepealed(parseLawXml(xmlText, 100), query)

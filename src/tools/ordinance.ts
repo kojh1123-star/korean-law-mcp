@@ -56,7 +56,10 @@ export async function getOrdinance(
     const ordinance = lawService.자치법규기본정보 || {}
 
     let resultText = `자치법규명: ${ordinance.자치법규명 || "알 수 없음"}\n`
-    resultText += `제정일: ${ordinance.공포일자 || ""}\n`
+    // 공포일자는 최신 공포본의 날짜다. "제정일"로 찍으면 일부개정일이 제정일로 둔갑한다
+    // (실측 강남구 규칙: 제개정정보=일부개정, 공포일자=20210416). 2026-09-23 리뷰 D11.
+    resultText += `공포일: ${ordinance.공포일자 || ""}\n`
+    if (ordinance.제개정정보) resultText += `제개정: ${ordinance.제개정정보}\n`
     resultText += `자치단체: ${ordinance.지자체기관명 || ""}\n`
     resultText += `시행일: ${ordinance.시행일자 || ""}\n`
 
@@ -101,7 +104,7 @@ export async function getOrdinance(
         }
         resultText += `목차 (총 ${articles.length}개 조문)\n\n`
         resultText += tocItems.join("\n")
-        resultText += `\n\n특정 조문 조회: get_ordinance(ordinSeq="${ordinSeq}", jo="제XX조")`
+        resultText += `\n\n특정 조문 조회: execute_tool(tool_name="get_ordinance", params={ordinSeq:"${ordinSeq}", jo:"제XX조"})`
       } else {
         for (const article of articles) {
           if (article.조제목) {

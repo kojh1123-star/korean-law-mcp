@@ -157,9 +157,20 @@ async function testCombinedResultsUseTopTwoTotal() {
 }
 
 async function main() {
+  // 같은 ID의 판례 fixture를 바꾸는 시나리오마다 전용 판례 캐시도 비운다
+  const { lawCache } = await import("../build/lib/cache.js")
+  const { precedentCache } = await import("../build/tools/precedents.js")
+  lawCache.clear()
+  precedentCache.clear()
   await testExtractsMultipleIds()
+  lawCache.clear()
+  precedentCache.clear()
   await testFetchesTopTwoPrecedentDetails()
+  lawCache.clear()
+  precedentCache.clear()
   await testFetchesTopOneNonPrecedentDetail()
+  lawCache.clear()
+  precedentCache.clear()
   await testCombinedResultsUseTopTwoTotal()
   console.log("search detail chain tests passed")
 }

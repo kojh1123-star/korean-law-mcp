@@ -10,8 +10,9 @@
  *   3. 추가(+) / 삭제(-) / 변경(△) 조문 분류 출력
  */
 import type { ScenarioContext, ScenarioResult, ScenarioSection } from "./types.js"
-import { fetchHistoricalVersionsFull, type HistoricalVersion } from "../../lib/historical-utils.js"
-import { hasLawNode } from "../../lib/api-client.js"
+import type { HistoricalVersion } from "../../lib/historical-utils.js"
+import { fetchLawVersions, sameLawName, wholeRevisionLabel, wholeRevisionsBetween } from "../../lib/law-lineage.js"
+import { dateSchema } from "../../lib/schemas.js"
 import {
   changeExcerpt, diffArticles, displayJo, dot, excerptBudget, extractLawSnapshot,
   type ArticleSnapshot, type LawSnapshot,
@@ -39,15 +40,14 @@ export function pickVersion(versions: HistoricalVersion[], targetDate: string): 
  * 공포본이면 시점과 무관하게 마지막 시행 슬라이스를 돌려준다 (실측: 형사소송법
  * MST 281865 → 시행 20271231 본문. 2026.7.1.에 시행 중인 슬라이스가 아니다).
  * 그대로 두면 "시점 A: 2026.7.1. 시행" 머리말에 2027.12.31.판 본문이 붙어
- * diff가 통째로 어긋난다. efYd가 없거나 eflaw가 빈 봉투면 기존 경로로 물러선다.
+ * diff가 통째로 어긋난다. 시행일이 없을 때만 MST 조회로 물러선다.
  */
 async function fetchVersionRaw(ctx: ScenarioContext, ver: HistoricalVersion): Promise<string> {
   if (ver.efYd) {
-    const raw = await ctx.apiClient.fetchApi({
+    return ctx.apiClient.fetchApi({
       endpoint: "lawService.do", target: "eflaw", type: "JSON",
       extraParams: { MST: ver.mst, efYd: ver.efYd }, apiKey: ctx.apiKey,
     })
-    if (hasLawNode(raw)) return raw
   }
   return ctx.apiClient.fetchApi({
     endpoint: "lawService.do", target: "law", type: "JSON",
@@ -79,10 +79,10 @@ export async function runTimeTravelScenario(ctx: ScenarioContext): Promise<Scena
     return { sections, suggestedActions }
   }
 
-  if (!/^\d{8}$/.test(fromDate) || !/^\d{8}$/.test(toDate)) {
+  if (!dateSchema.safeParse(fromDate).success || !dateSchema.safeParse(toDate).success) {
     sections.push({
       title: "Time Travel — 시점 비교 (v4.0)",
-      content: `⚠️ 날짜 형식 오류: fromDate=${fromDate}, toDate=${toDate} (YYYYMMDD 8자리 필요)`,
+      content: `⚠️ 날짜 오류: fromDate=${fromDate}, toDate=${toDate} (유효한 YYYYMMDD 날짜 필요)`,
     })
     return { sections, suggestedActions }
   }
@@ -92,7 +92,9 @@ export async function runTimeTravelScenario(ctx: ScenarioContext): Promise<Scena
   let totalCount = 0
   let fetchedPages = 0
   try {
-    const r = await fetchHistoricalVersionsFull(ctx.apiClient, lawName, ctx.apiKey)
+    // 법령ID 계보 — 두 시점 사이에 제명이 바뀌어도(소방시설법 2022.12.1.) 옛 이름 시절 버전을 잡는다.
+    // 이른 시점이 계보 시작 전이면 폐지 후 재제정되기 전의 동명 구법(법령ID가 다르다)까지 받는다
+    const r = await fetchLawVersions(ctx.apiClient, lawName, ctx.apiKey, ctx.law?.lawId, fromDate < toDate ? fromDate : toDate)
     versions = r.versions
     totalCount = r.totalCount
     fetchedPages = r.fetchedPages
@@ -107,7 +109,7 @@ export async function runTimeTravelScenario(ctx: ScenarioContext): Promise<Scena
   if (versions.length === 0) {
     sections.push({
       title: "Time Travel — 시점 비교 (v4.0)",
-      content: `[NOT_FOUND] '${lawName}' 연혁을 찾을 수 없습니다. 법령명 띄어쓰기/오타를 확인하세요.\n참고: 법제처 응답 총 ${totalCount}건 (정확매칭 0건). 입력 법령명이 lsHistory의 '법령명한글'과 정확히 일치해야 합니다 (공백 제거 비교).`,
+      content: `[NOT_FOUND] '${lawName}' 연혁을 찾을 수 없습니다. 법령명 띄어쓰기/오타를 확인하세요.\n참고: 법제처 응답 총 ${totalCount}건 (정확매칭 0건). 법령ID 계보를 못 잡으면 입력 법령명이 연혁의 법령명과 정확히 일치해야 합니다 (공백 제거 비교).`,
     })
     return { sections, suggestedActions }
   }
@@ -200,10 +202,21 @@ export async function runTimeTravelScenario(ctx: ScenarioContext): Promise<Scena
 
   let body = header
 
+  // 제명 변경·전부개정을 가로지르면 조번호 대조가 다른 조문끼리의 비교가 된다 — diff 앞에 밝힌다
+  if (oldVer.lawNm && newVer.lawNm && !sameLawName(oldVer.lawNm, newVer.lawNm)) {
+    body += `\n제명 변경: 「${oldVer.lawNm}」 → 「${newVer.lawNm}」 (같은 법령ID)`
+  }
+  const [intervalFrom, intervalTo] = [oldVer.efYd, newVer.efYd].sort()
+  const whole = wholeRevisionsBetween(versions, intervalFrom, intervalTo)
+  if (whole.length > 0) {
+    const w = whole[whole.length - 1]
+    body += `\n⚠️ 두 시점 사이 ${wholeRevisionLabel(w)}(시행 ${dot(w.efYd) || w.efYd}, 공포 제${w.ancNo}호) — 조문 체계가 바뀌어 아래 조번호 대조는 번호만 같은 다른 조문일 수 있습니다. 조문 제목으로 대응 관계를 확인하세요.`
+  }
+
   // 두 시점 사이에 낀 개정들 — 각 변경의 근거 공포를 특정할 수 있게 한다 (#96)
   const between = versions
-    .filter(v => parseInt(v.efYd || "0", 10) > parseInt(oldVer.efYd || "0", 10)
-              && parseInt(v.efYd || "0", 10) <= parseInt(newVer.efYd || "0", 10))
+    .filter(v => parseInt(v.efYd || "0", 10) > parseInt(intervalFrom || "0", 10)
+              && parseInt(v.efYd || "0", 10) <= parseInt(intervalTo || "0", 10))
     .sort((x, y) => parseInt(x.efYd || "0", 10) - parseInt(y.efYd || "0", 10))
   if (between.length > 0) {
     body += `\n\n[구간 개정 연혁] ${between.length}건 — 아래 변경들의 근거`
